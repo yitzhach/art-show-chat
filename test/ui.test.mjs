@@ -12,7 +12,8 @@ function browser(path, storage = {}) {
   const dom = new JSDOM(html, { url: BASE + path, runScripts: "outside-only", pretendToBeVisual: true });
   const w = dom.window;
   for (const [k, v] of Object.entries(storage)) w.localStorage.setItem(k, v);
-  w.fetch = (u, o) => fetch(new URL(u, BASE), o);
+  w.__net = true; // set false to act like a phone with no signal
+  w.fetch = (u, o) => (w.__net || String(u).startsWith("data:") ? fetch(String(u).startsWith("data:") ? u : new URL(u, BASE), o) : Promise.reject(new TypeError("offline")));
   w.WebSocket = WebSocket;
   w.matchMedia = () => ({ matches: false, addEventListener() {} });
   Object.defineProperty(w, "crypto", { value: globalThis.crypto });
@@ -52,6 +53,18 @@ assert(text(a).includes("Show chat") && text(a).includes("Buyers"), "artist sees
 a.document.getElementById("compose-input").value = "Hello from booth A14";
 submit(a, "form.composer"); await sleep(700);
 assert(text(a).includes("Hello from booth A14") && !text(a).includes("Sending"), "message sent and shown");
+
+// No signal: the message waits on the phone, survives closing the app, and sends once signal is back
+a.__net = false;
+a.document.getElementById("compose-input").value = "Sent with no signal";
+submit(a, "form.composer"); await sleep(600);
+const queued = JSON.parse(a.localStorage.getItem(`asc.outbox.${code}`) || "[]");
+assert(queued.length === 1 && text(a).includes("Sent with no signal"), "message is kept on the phone with no signal");
+const offStore = { "asc.sessions": artStore, [`asc.outbox.${code}`]: a.localStorage.getItem(`asc.outbox.${code}`) };
+const oldA = a; // the old copy stays without signal
+a = browser(`/s/${code}#group`, offStore); await sleep(1500);
+assert(JSON.parse(a.localStorage.getItem(`asc.outbox.${code}`) || "[]").length === 0, "queued message sent after reopening with signal");
+a.dispatchEvent(new a.Event("online")); await sleep(300);
 
 // Director sees it, sends an urgent announcement
 d = browser(`/s/${code}#group`, { "asc.sessions": dirStore }); await sleep(900);

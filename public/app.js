@@ -170,12 +170,19 @@ async function compressImage(file, max = 1600, quality = 0.82) {
 }
 const blobToDataUrl = (b) => new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(b); });
 async function uploadPhoto(code, token, dataUrl) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 45000);
   try {
     const blob = await (await fetch(dataUrl)).blob();
-    const r = await fetch(`${API_BASE}/api/show/${code}/upload`, { method: "POST", headers: { "content-type": blob.type || "image/jpeg", authorization: "Bearer " + token }, body: blob });
+    const r = await fetch(`${API_BASE}/api/show/${code}/upload`, { method: "POST", headers: { "content-type": blob.type || "image/jpeg", authorization: "Bearer " + token }, body: blob, signal: ctl.signal });
     const data = await r.json().catch(() => ({}));
     return { ok: r.ok, status: r.status, data };
-  } catch { return { ok: false, status: 0, data: {} }; }
+  } catch { return { ok: false, status: 0, data: {} }; } finally { clearTimeout(timer); }
+}
+// Wait longer after each failed try (2s, 4s, 8s... up to 30s), with a little randomness so a
+// room full of phones coming back onto the wifi doesn't all retry in the same second.
+function retryDelay(tries) {
+  return Math.min(30000, 2000 * 2 ** Math.min(tries, 4)) + Math.floor(Math.random() * 1500);
 }
 // Ask for a photo, shrink it on the phone (faster on bad signal), return it as a data URL.
 function pickPhoto() {
@@ -372,7 +379,7 @@ function ChatApp(code, sess) {
     alerts: pushSupported() && Notification.permission === "granted" ? "on" : "off",
   };
   const token = sess.token;
-  let ws = null, backoff = 1000, openedAt = 0, lastPong = Date.now(), syncing = false, flushing = false, retryTimer = null;
+  let ws = null, backoff = 1000, openedAt = 0, sendTries = 0, lastPong = Date.now(), syncing = false, flushing = false, retryTimer = null;
   const origin = SITE;
   const isDirector = () => S.me.role === "director";
   const member = (id) => S.members.find((m) => m.id === id);
@@ -450,14 +457,14 @@ function ChatApp(code, sess) {
       }
       const { photo, ...payload } = item;
       const r = await api(`/show/${code}/send`, { method: "POST", token, body: payload });
-      if (r.ok) { S.outbox.shift(); saveOutbox(); merge([r.data.message]); continue; }
+      if (r.ok) { sendTries = 0; S.online = true; S.outbox.shift(); saveOutbox(); merge([r.data.message]); continue; }
       if (r.status === 401) { flushing = false; return signedOut(); }
       if (r.status === 0 || r.status >= 500 || r.status === 429) { if (r.status === 0) S.online = false; break; }
       S.outbox.shift(); saveOutbox();
       toast(r.data.error || "That message couldn't be sent.");
     }
     flushing = false;
-    if (S.outbox.length) retryTimer = setTimeout(flush, 4000);
+    if (S.outbox.length) retryTimer = setTimeout(flush, retryDelay(sendTries++));
     render({ soft: true });
   }
 
@@ -506,7 +513,7 @@ function ChatApp(code, sess) {
     sendVis();
     if (document.visibilityState === "visible") { sync(); flush(); connect(); render({ soft: true }); }
   });
-  addEventListener("online", () => { S.online = true; sync(); flush(); connect(); render({ soft: true }); });
+  addEventListener("online", () => { S.online = true; sendTries = 0; sync(); flush(); connect(); render({ soft: true }); });
   addEventListener("offline", () => setOnline(false));
   addEventListener("hashchange", () => render({ stick: true }));
   if (navigator.serviceWorker) navigator.serviceWorker.addEventListener("message", (e) => { if (e.data && e.data.t === "push") sync(); });
@@ -974,9 +981,17 @@ async function Buyer(code, artistId) {
   const CK = "asc.bcache." + key;
   const cached = store.get(CK, {});
   const B = { artist: cached.artist || null, show: cached.show || null, buyer: cached.buyer || null, messages: cached.messages || [], outbox: store.get("asc.boutbox." + key, []), online: true, alerts: pushSupported() && Notification.permission === "granted" ? "on" : "off" };
-  let ws = null, backoff = 1000, openedAt = 0, flushing = false, lastHtml = "";
+  let ws = null, backoff = 1000, openedAt = 0, flushing = false, lastHtml = "", sendTries = 0, retryTimer = null, lastPong = Date.now();
 
-  const info = await api(`/show/${code}/artist?id=${artistId}`);
+  let info = await api(`/show/${code}/artist?id=${artistId}`, { timeout: 10000 });
+  if (!info.ok && info.status !== 404 && !B.artist) {
+    // Weak signal at the booth: say so and keep trying by itself.
+    app.innerHTML = `<section class="screen"><div class="empty"><h3>Waiting for signal</h3><p>This page will open by itself as soon as your phone connects.</p><button class="btn small" onclick="location.reload()">Try again</button></div></section>`;
+    for (let i = 0; i < 40 && !info.ok && info.status !== 404; i++) {
+      await new Promise((r) => { const t = setTimeout(r, retryDelay(i)); addEventListener("online", () => { clearTimeout(t); r(); }, { once: true }); });
+      info = await api(`/show/${code}/artist?id=${artistId}`, { timeout: 10000 });
+    }
+  }
   if (info.ok) { B.artist = info.data.artist; B.show = info.data.show; }
   else if (!B.artist) {
     app.innerHTML = `<section class="screen"><div class="empty"><h3>${info.status === 404 ? "This card isn't active" : "Can't load this page"}</h3><p>${info.status === 404 ? "The artist may have left the show chat." : "Check your signal and try again."}</p><button class="btn small" onclick="location.reload()">Try again</button></div></section>`;
@@ -1016,13 +1031,14 @@ async function Buyer(code, artistId) {
       if (item.photo && !s) break;
       if (item.photo && s) {
         const up = await uploadPhoto(code, s.token, item.photo);
-        if (!up.ok) { if (up.status === 0 || up.status >= 500) { B.online = up.status !== 0; break; } B.outbox.shift(); saveOutbox(); toast(up.data.error || "That photo couldn't be sent."); continue; }
+        if (!up.ok) { if (up.status === 0 || up.status >= 500 || up.status === 429) { B.online = up.status !== 0; break; } B.outbox.shift(); saveOutbox(); toast(up.data.error || "That photo couldn't be sent."); continue; }
         item.meta = { img: up.data.id }; delete item.photo; saveOutbox();
       }
       let r;
       if (!s) r = await api(`/show/${code}/buyer/start`, { method: "POST", body: { ...item, artist: artistId } });
       else r = await api(`/show/${code}/buyer/send`, { method: "POST", token: s.token, body: item });
       if (r.ok) {
+        sendTries = 0; B.online = true;
         if (!s && r.data.token) { saveBuyer(key, { token: r.data.token }); B.buyer = r.data.buyer; setManifest(`/b/${code}/${artistId}?k=${r.data.token}`, `${A().name}`); connect(); }
         B.outbox.shift(); saveOutbox(); merge([r.data.message]);
         if (!s) { flushing = false; return flush(); }
@@ -1032,19 +1048,24 @@ async function Buyer(code, artistId) {
       B.outbox.shift(); saveOutbox(); toast(r.data.error || "That message couldn't be sent.");
     }
     flushing = false;
-    if (B.outbox.length) setTimeout(flush, 4000);
+    clearTimeout(retryTimer);
+    if (B.outbox.length) retryTimer = setTimeout(flush, retryDelay(sendTries++));
     render();
   }
   function connect() {
     const s = sess(); if (!s || (ws && ws.readyState <= 1)) return;
     ws = new WebSocket(`${WS_BASE}/api/show/${code}/ws?t=${encodeURIComponent(s.token)}`);
-    ws.onopen = () => { openedAt = Date.now(); sync(); flush(); ws.send(JSON.stringify({ t: "vis", v: document.visibilityState === "visible" })); };
-    ws.onmessage = (e) => { if (e.data === "pong") return; try { const d = JSON.parse(e.data); if (d.t === "msg" && merge([d.m])) render(); } catch {} };
+    ws.onopen = () => { openedAt = Date.now(); lastPong = Date.now(); sync(); flush(); ws.send(JSON.stringify({ t: "vis", v: document.visibilityState === "visible" })); };
+    ws.onmessage = (e) => { lastPong = Date.now(); if (e.data === "pong") return; try { const d = JSON.parse(e.data); if (d.t === "msg" && merge([d.m])) render(); } catch {} };
     ws.onclose = () => { ws = null; if (openedAt && Date.now() - openedAt > 15000) backoff = 1000; openedAt = 0; setTimeout(connect, backoff); backoff = Math.min(backoff * 2, 20000); };
   }
-  setInterval(() => { if (ws && ws.readyState === 1) ws.send("ping"); else if (sess()) sync(); }, 20000);
+  setInterval(() => {
+    // A socket that stopped answering on flaky wifi gets closed, so it reconnects instead of sitting silent.
+    if (ws && ws.readyState === 1) { if (Date.now() - lastPong > 70000) { try { ws.close(); } catch {} return; } ws.send("ping"); }
+    else if (sess()) { sync(); connect(); }
+  }, 20000);
   document.addEventListener("visibilitychange", () => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: "vis", v: document.visibilityState === "visible" })); if (document.visibilityState === "visible") { sync(); flush(); connect(); } });
-  addEventListener("online", () => { B.online = true; flush(); sync(); connect(); });
+  addEventListener("online", () => { B.online = true; sendTries = 0; flush(); sync(); connect(); });
   addEventListener("offline", () => { B.online = false; render(); });
 
   function head() {

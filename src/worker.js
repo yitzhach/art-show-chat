@@ -141,6 +141,17 @@ export class ShowRoom extends DurableObject {
       ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     } catch {}
     this.buyerStarts = [];
+    this.sendTimes = new Map();
+  }
+  // Each person can send up to 40 messages a minute; a stuck phone resending in a loop can't swamp the show.
+  floodCheck(id) {
+    const now = Date.now();
+    const list = (this.sendTimes.get(id) || []).filter((t) => now - t < 60000);
+    if (list.length >= 40) { this.sendTimes.set(id, list); return true; }
+    list.push(now);
+    this.sendTimes.set(id, list);
+    if (this.sendTimes.size > 2000) this.sendTimes.clear();
+    return false;
   }
 
   // ---------- small helpers ----------
@@ -397,6 +408,7 @@ export class ShowRoom extends DurableObject {
   }
 
   async send(me, body, show) {
+    if (this.floodCheck(me.id)) return err("You're sending very fast. It'll go through in a moment.", 429);
     const text = clean(body.body, LIMITS.body);
     const channel = String(body.channel || "");
     let kind = "text";
@@ -457,7 +469,7 @@ export class ShowRoom extends DurableObject {
     }
     const now = Date.now();
     this.buyerStarts = this.buyerStarts.filter((t) => now - t < 60000);
-    if (this.buyerStarts.length > 40) return err("Too many new messages right now. Try again in a minute.", 429);
+    if (this.buyerStarts.length > 150) return err("Too many new messages right now. Try again in a minute.", 429);
     this.buyerStarts.push(now);
     const total = this.sql.exec("SELECT COUNT(*) AS n FROM buyers").one().n;
     if (total > 5000) return err("This show can't take more visitor messages.", 403);
@@ -488,6 +500,7 @@ export class ShowRoom extends DurableObject {
   }
 
   buyerSend(p, body, show) {
+    if (this.floodCheck(p.id)) return err("You're sending very fast. It'll go through in a moment.", 429);
     const b = this.buyer(p.id);
     if (!this.member(b.artist_id)) return err("This artist isn't in the show chat any more.", 404);
     const text = clean(body.body, LIMITS.body);
