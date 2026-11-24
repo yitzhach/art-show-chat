@@ -81,6 +81,32 @@ assert(old.status === 401, "old sign-in stops working");
 r = await call(`/show/${code}/sync?since=0`, { token: r.data.token });
 assert(r.status === 200 && r.data.me.name === "Leo Park", "new link signs in as the same artist");
 
+// photos
+const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+let up = await fetch(BASE + `/api/show/${code}/upload`, { method: "POST", headers: { "content-type": "image/png", authorization: "Bearer " + maya.token }, body: png }).then((x) => x.json());
+assert(up.id, "artist uploads a photo");
+let img = await fetch(BASE + `/api/show/${code}/img/${up.id}`);
+assert(img.status === 200 && img.headers.get("content-type") === "image/png", "photo is served by its link");
+r = await call(`/show/${code}/send`, { method: "POST", token: maya.token, body: { id: "c6", channel: "buy:" + buyer.buyer.id, body: "", meta: { img: up.id } } });
+assert(r.status === 200 && r.data.message.meta.img === up.id, "photo-only message to buyer");
+up = await fetch(BASE + `/api/show/${code}/upload`, { method: "POST", headers: { "content-type": "image/png", authorization: "Bearer " + buyer.token }, body: png }).then((x) => x.json());
+r = await call(`/show/${code}/buyer/send`, { method: "POST", token: buyer.token, body: { id: "b3", body: "Like this one", meta: { img: up.id } } });
+assert(r.status === 200 && r.data.message.meta.img, "buyer sends a photo");
+r = await call(`/show/${code}/send`, { method: "POST", token: maya.token, body: { channel: "group", body: "", meta: { img: "notarealimageid123456" } } });
+assert(r.status === 400, "fake photo ids are refused");
+let bad = await fetch(BASE + `/api/show/${code}/upload`, { method: "POST", headers: { "content-type": "text/html", authorization: "Bearer " + maya.token }, body: "<b>x</b>" });
+assert(bad.status === 400, "non-images are refused");
+
+// artist contact + buyer moves the chat
+r = await call(`/show/${code}/me`, { method: "POST", token: maya.token, body: { phone: "(305) 555-0199", email: "maya@example.com" } });
+assert(r.data.me.phone === "(305) 555-0199", "artist adds phone for buyers");
+r = await call(`/show/${code}/artist?id=${maya.me.id}`);
+assert(r.data.artist.email === "maya@example.com", "QR page gets artist's contact");
+r = await call(`/show/${code}/buyer/move`, { method: "POST", token: buyer.token, body: { id: "mv1", to: "text", all: true } });
+assert(r.status === 200 && r.data.message.kind === "move" && r.data.buyer.moved === "text", "buyer moves the chat to text");
+r = await call(`/show/${code}/sync?since=0`, { token: maya.token });
+assert(r.data.buyers[0].moved === "text" && r.data.messages.some((m) => m.kind === "move"), "artist sees the move");
+
 await new Promise((res) => setTimeout(res, 300));
 assert(live.some((x) => x.t === "msg" && x.m.kind === "ref"), "Maya got the referral live over the socket");
 assert(live.some((x) => x.t === "msg" && x.m.ch.startsWith("buy:")), "Maya got the buyer message live");

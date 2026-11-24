@@ -1,6 +1,11 @@
 // Show Chat beta 1.0: the whole phone app in one file, no build step.
 const VERSION = "1.0";
 const app = document.getElementById("app");
+// A native app wrapper can set these before app.js loads; on the web they're this site.
+const API_BASE = (window.SHOW_CHAT_API || "").replace(/\/$/, "");
+const SITE = (window.SHOW_CHAT_SITE || location.origin).replace(/\/$/, "");
+const WS_BASE = (API_BASE || location.origin).replace(/^http/, "ws");
+const imgUrl = (code, id) => `${API_BASE || SITE}/api/show/${code}/img/${id}`;
 
 // ---------- storage (wrapped: private windows can throw) ----------
 const store = {
@@ -73,7 +78,7 @@ async function api(path, { method = "GET", body, token, timeout = 15000 } = {}) 
     const headers = {};
     if (body !== undefined) headers["content-type"] = "application/json";
     if (token) headers.authorization = "Bearer " + token;
-    const r = await fetch("/api" + path, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined, signal: ctl.signal, cache: "no-store" });
+    const r = await fetch(API_BASE + "/api" + path, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined, signal: ctl.signal, cache: "no-store" });
     let data = {};
     try { data = await r.json(); } catch {}
     return { ok: r.ok, status: r.status, data };
@@ -148,6 +153,71 @@ function alertsHelp(reason) {
   if (reason === "offline") return "Couldn't reach the server. Try again when you have signal.";
   return "Alerts didn't turn on. Try again.";
 }
+
+// ---------- photos ----------
+async function compressImage(file, max = 1600, quality = 0.82) {
+  let src, w, h;
+  try { src = await createImageBitmap(file, { imageOrientation: "from-image" }); w = src.width; h = src.height; }
+  catch {
+    src = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = URL.createObjectURL(file); });
+    w = src.naturalWidth; h = src.naturalHeight;
+  }
+  const scale = Math.min(1, max / Math.max(w, h));
+  const c = document.createElement("canvas");
+  c.width = Math.round(w * scale); c.height = Math.round(h * scale);
+  c.getContext("2d").drawImage(src, 0, 0, c.width, c.height);
+  return new Promise((res) => c.toBlob(res, "image/jpeg", quality));
+}
+const blobToDataUrl = (b) => new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(b); });
+async function uploadPhoto(code, token, dataUrl) {
+  try {
+    const blob = await (await fetch(dataUrl)).blob();
+    const r = await fetch(`${API_BASE}/api/show/${code}/upload`, { method: "POST", headers: { "content-type": blob.type || "image/jpeg", authorization: "Bearer " + token }, body: blob });
+    const data = await r.json().catch(() => ({}));
+    return { ok: r.ok, status: r.status, data };
+  } catch { return { ok: false, status: 0, data: {} }; }
+}
+// Ask for a photo, shrink it on the phone (faster on bad signal), return it as a data URL.
+function pickPhoto() {
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file"; input.accept = "image/*";
+    input.onchange = async () => {
+      const f = input.files && input.files[0];
+      if (!f) return resolve(null);
+      try { resolve(await blobToDataUrl(await compressImage(f))); } catch { toast("Couldn't read that photo."); resolve(null); }
+    };
+    input.click();
+  });
+}
+function photoHtml(src) {
+  return `<button type="button" class="photo" data-photo="${esc(src)}" aria-label="Open photo"><img src="${esc(src)}" alt="Photo" loading="lazy"></button>`;
+}
+document.addEventListener("click", (e) => {
+  const p = e.target.closest("[data-photo]");
+  if (p) {
+    const box = document.createElement("div");
+    box.className = "lightbox";
+    box.innerHTML = `<img src="${esc(p.dataset.photo)}" alt="Photo"><button class="lb-close" aria-label="Close">✕</button>`;
+    box.onclick = () => box.remove();
+    document.body.appendChild(box);
+  }
+});
+// The whole conversation as plain text, for carrying it to a text, email or Instagram DM.
+function transcript(code, messages, nameOf, header, link) {
+  const lines = [header, ""];
+  for (const m of messages) {
+    if (m.kind === "move" || m.kind === "system") continue;
+    const who = nameOf(m.from);
+    if (m.meta && m.meta.img) lines.push(`${who}: [photo] ${imgUrl(code, m.meta.img)}`);
+    if (m.body) lines.push(`${who}: ${m.body}`);
+  }
+  if (link) lines.push("", link);
+  return lines.join("\n");
+}
+const smsHref = (phone, body) => `sms:${phone.replace(/[^\d+]/g, "")}?&body=${encodeURIComponent(body)}`;
+const mailHref = (email, subject, body) => `mailto:${encodeURIComponent(email).replace(/%40/g, "@")}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+const PHOTO_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="15" rx="3"/><circle cx="12" cy="12.5" r="3.5"/><path d="M8.5 5l1.5-2h4l1.5 2"/></svg>`;
 
 // ---------- QR ----------
 function qrSvg(text) {
@@ -303,7 +373,7 @@ function ChatApp(code, sess) {
   };
   const token = sess.token;
   let ws = null, backoff = 1000, lastPong = Date.now(), syncing = false, flushing = false, retryTimer = null;
-  const origin = location.origin;
+  const origin = SITE;
   const isDirector = () => S.me.role === "director";
   const member = (id) => S.members.find((m) => m.id === id);
   const buyer = (id) => S.buyers.find((b) => b.id === id);
@@ -370,8 +440,17 @@ function ChatApp(code, sess) {
     clearTimeout(retryTimer);
     while (S.outbox.length) {
       const item = S.outbox[0];
-      const r = await api(`/show/${code}/send`, { method: "POST", token, body: item });
-      if (r.ok) { S.outbox.shift(); saveOutbox(); merge([r.data.message]); S.lastSeq = Math.max(S.lastSeq, 0); continue; }
+      if (item.photo) {
+        const up = await uploadPhoto(code, token, item.photo);
+        if (!up.ok) {
+          if (up.status === 0 || up.status >= 500 || up.status === 429) { if (up.status === 0) S.online = false; break; }
+          S.outbox.shift(); saveOutbox(); toast(up.data.error || "That photo couldn't be sent."); continue;
+        }
+        item.meta = { ...(item.meta || {}), img: up.data.id }; delete item.photo; saveOutbox();
+      }
+      const { photo, ...payload } = item;
+      const r = await api(`/show/${code}/send`, { method: "POST", token, body: payload });
+      if (r.ok) { S.outbox.shift(); saveOutbox(); merge([r.data.message]); continue; }
       if (r.status === 401) { flushing = false; return signedOut(); }
       if (r.status === 0 || r.status >= 500 || r.status === 429) { if (r.status === 0) S.online = false; break; }
       S.outbox.shift(); saveOutbox();
@@ -391,8 +470,7 @@ function ChatApp(code, sess) {
 
   function connect() {
     if (ws && ws.readyState <= 1) return;
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    try { ws = new WebSocket(`${proto}://${location.host}/api/show/${code}/ws?t=${encodeURIComponent(token)}`); }
+    try { ws = new WebSocket(`${WS_BASE}/api/show/${code}/ws?t=${encodeURIComponent(token)}`); }
     catch { ws = null; return; }
     ws.onopen = () => { backoff = 1000; lastPong = Date.now(); sendVis(); S.online = true; sync(); flush(); };
     ws.onmessage = (e) => {
@@ -488,6 +566,7 @@ function ChatApp(code, sess) {
   function msgHtml(m, prev) {
     const mine = m.from === S.me.id;
     if (m.kind === "system") return `<p class="sys">${esc(m.body)}</p>`;
+    if (m.kind === "move") return `<p class="sys moved">${esc(m.body)}</p>`;
     if (m.kind === "ann") {
       const urgent = m.meta && m.meta.urgent;
       const dir = member(m.from);
@@ -508,11 +587,11 @@ function ChatApp(code, sess) {
     return `<div class="msg ${mine ? "me" : ""} ${cont ? "cont" : ""}">
       ${showFrom ? (cont ? `<span class="av sm" style="visibility:hidden"></span>` : avatar(sender || { id: m.from, name }, "sm")) : ""}
       <div class="body">${showFrom ? `<p class="from"><b>${esc(name)}</b>${boothTag(sender)}<span class="time">${fmtTime(m.ts)}</span></p>` : ""}
-      <div class="bubble">${m.meta && m.meta.piece ? `<b>About ${esc(m.meta.piece)}:</b> ` : ""}${linkify(m.body)}</div>
+      ${m.meta && m.meta.img ? photoHtml(imgUrl(code, m.meta.img)) : ""}${m.body ? `<div class="bubble">${m.meta && m.meta.piece ? `<b>About ${esc(m.meta.piece)}:</b> ` : ""}${linkify(m.body)}</div>` : ""}
       ${!showFrom ? `<span class="state">${fmtTime(m.ts)}</span>` : ""}</div></div>`;
   }
   function pendingHtml(o) {
-    return `<div class="msg me pending"><div class="body"><div class="bubble">${o.kind === "ref" ? "Buyer referral" : linkify(o.body)}</div><span class="state">${S.online ? "Sending…" : "Waiting for signal"}</span></div></div>`;
+    return `<div class="msg me pending"><div class="body">${o.photo ? photoHtml(o.photo) : ""}${o.body || o.kind === "ref" ? `<div class="bubble">${o.kind === "ref" ? "Buyer referral" : linkify(o.body)}</div>` : ""}<span class="state">${S.online ? "Sending…" : "Waiting for signal"}</span></div></div>`;
   }
   function feed(chs, emptyText) {
     const list = S.messages.filter((m) => chs.includes(m.ch));
@@ -560,6 +639,7 @@ function ChatApp(code, sess) {
   function composer(ch, placeholder, { refer = false } = {}) {
     return `<form class="composer" data-compose="${esc(ch)}">
       ${refer ? `<button class="refbtn" type="button" data-go="refer">${ICON.refer}Refer</button>` : ""}
+      <button class="photobtn" type="button" data-act="photo" aria-label="Send a photo">${PHOTO_ICON}</button>
       <textarea class="input" rows="1" id="compose-input" data-draft="c:${esc(ch)}" placeholder="${esc(placeholder)}" aria-label="Message" enterkeyhint="send"></textarea>
       <button class="send" type="submit" aria-label="Send">${ICON.send}</button></form>`;
   }
@@ -604,7 +684,10 @@ function ChatApp(code, sess) {
     const ch = "buy:" + bid;
     markRead(ch);
     const tel = b.phone.replace(/[^\d+]/g, "");
-    const contact = (b.phone ? `<a href="sms:${esc(tel)}">Text ${esc(b.phone)}</a><a href="tel:${esc(tel)}">Call</a>` : "") + (b.email ? `<a href="mailto:${esc(b.email)}">Email</a>` : "");
+    const contact = (b.phone ? `<a href="sms:${esc(tel)}">Text ${esc(b.phone)}</a><a href="tel:${esc(tel)}">Call</a>` : "") + (b.email ? `<a href="mailto:${esc(b.email)}">Email ${esc(b.email)}</a>` : "");
+    const movedLabel = { text: "text", email: "email", instagram: "Instagram" }[b.moved];
+    const canSend = (b.moved === "text" && b.phone) || (b.moved === "email" && b.email);
+    const moved = b.moved ? `<div class="followup"><span><b>${esc(b.name || "This buyer")} wants to carry on by ${movedLabel}.</b> ${canSend ? "Send them the whole conversation from your phone in one tap:" : b.moved === "instagram" ? `Look for their message in your Instagram DMs${S.me.instagram ? "" : " (add your Instagram handle under You so buyers can find you)"}.` : "They didn't leave the details for that, so reply here."}</span>${canSend ? `<div class="btnrow"><button class="btn small" data-act="send-thread" data-id="${esc(bid)}" data-via="${b.moved}">${b.moved === "text" ? "Text" : "Email"} the whole conversation</button></div>` : ""}</div>` : "";
     let follow = "";
     if (S.followup && S.followup.bid === bid && (b.phone || b.email)) {
       const msg = `${S.followup.text}\n\n— ${S.me.name}${S.me.booth ? ", Booth " + S.me.booth : ""}, ${S.show.name}\nKeep chatting here: ${buyerLink(b)}`;
@@ -614,7 +697,7 @@ function ChatApp(code, sess) {
         <button class="btn small ghost" data-act="followed">Skip</button></div></div>`;
     }
     return `<section class="screen">${subBar(esc(b.name || "Visitor"), "Buyer · from your QR card")}
-      <div class="contactbar">${contact || `<span class="none">No phone or email. They see your reply when they come back to the page.</span>`}<a href="#" data-act="copy-buyer" data-id="${esc(bid)}">Copy their chat link</a></div>${banners()}
+      <div class="contactbar">${contact || `<span class="none">No phone or email. They see your reply when they come back to the page.</span>`}<a href="#" data-act="copy-buyer" data-id="${esc(bid)}">Copy their chat link</a>${b.phone && !b.moved ? `<a href="#" data-act="send-thread" data-id="${esc(bid)}" data-via="text">Text them the whole chat</a>` : ""}</div>${banners()}${moved}
       <div class="scroll" id="scroller">${feed([ch], "")}</div>${follow}${composer(ch, "Reply to " + (b.name || "this buyer"))}</section>`;
   }
   function vGone(text) {
@@ -671,6 +754,10 @@ function ChatApp(code, sess) {
           <div class="row2"><div class="field"><label class="label" for="me-booth">Booth</label><input class="input" id="me-booth" value="${esc(me.booth || "")}" maxlength="12"></div>
           <div class="field"><label class="label" for="me-ig">Instagram</label><input class="input" id="me-ig" value="${esc(me.instagram ? "@" + me.instagram : "")}" maxlength="60" autocapitalize="none" placeholder="@yourname"></div></div>
           <div class="field"><label class="label" for="me-medium">What you make</label><input class="input" id="me-medium" value="${esc(me.medium || "")}" maxlength="80"></div>
+          ${me.role === "artist" ? `<p class="label" style="margin-top:4px">How buyers can reach you outside the app (optional)</p>
+          <div class="row2"><div class="field"><label class="label" for="me-phone">Phone for texts</label><input class="input" id="me-phone" type="tel" value="${esc(me.phone || "")}" maxlength="30" autocomplete="tel"></div>
+          <div class="field"><label class="label" for="me-email">Email</label><input class="input" id="me-email" type="email" value="${esc(me.email || "")}" maxlength="120" autocomplete="email"></div></div>
+          <p class="small">If you add these, buyers on your QR page get one-tap buttons to move the chat to text or email, with the whole conversation.</p>` : ""}
           <button class="btn ghost">Save</button></form>
         <div class="card"><h3>Alerts</h3>
           ${S.alerts === "on" ? `<p class="hint">Alerts are on for this phone. You'll get buyer messages, referrals, direct messages and announcements.</p><div class="btnrow"><button class="btn small ghost" data-act="test-alert">Send me a test alert</button></div>`
@@ -751,6 +838,7 @@ function ChatApp(code, sess) {
   app.addEventListener("click", async (e) => {
     const t = e.target.closest("[data-go],[data-tab],[data-act],[data-to],[data-status],[data-urgent]");
     if (!t) return;
+    if (t.tagName === "A" && t.getAttribute("href") === "#") e.preventDefault();
     if (t.dataset.go) { e.preventDefault(); return go(t.dataset.go); }
     if (t.dataset.tab) { history.replaceState(null, "", "#" + t.dataset.tab); return render(); }
     if (t.dataset.to) { S.refer.to = t.dataset.to; return render(); }
@@ -768,6 +856,22 @@ function ChatApp(code, sess) {
       return;
     }
     if (act === "copy") return copyText(t.dataset.text);
+    if (act === "photo") {
+      const form = t.closest("form"); const ch = form && form.dataset.compose;
+      const photo = await pickPhoto(); if (!photo || !ch) return;
+      const input = $("#compose-input"); const body = input ? input.value.trim() : "";
+      if (input) { input.value = ""; S.draft["c:" + ch] = ""; }
+      queue({ channel: ch, body, photo });
+      return;
+    }
+    if (act === "send-thread") {
+      const b = buyer(t.dataset.id); if (!b) return;
+      const msgs = S.messages.filter((m) => m.ch === "buy:" + b.id);
+      const nameOf = (id) => (id === S.me.id ? S.me.name : b.name || "You");
+      const txt = transcript(code, msgs, nameOf, `Our conversation from ${S.show.name} (${S.me.name}${S.me.booth ? ", Booth " + S.me.booth : ""}):`, `Keep chatting here: ${buyerLink(b)}`);
+      location.href = t.dataset.via === "email" ? mailHref(b.email, `Our conversation from ${S.show.name}`, txt) : smsHref(b.phone, txt);
+      return;
+    }
     if (act === "copy-buyer") { e.preventDefault(); const b = buyer(t.dataset.id); return b && copyText(buyerLink(b), "Their chat link is copied"); }
     if (act === "followed") { S.followup = null; setTimeout(render, 300); return; }
     if (act === "share-invite") return shareOrCopy(S.show.name, `Join the ${S.show.name} show chat. Code ${code}:`, `${origin}/s/${code}`);
@@ -815,7 +919,9 @@ function ChatApp(code, sess) {
       return;
     }
     if (f.id === "me-form") {
-      const r = await api(`/show/${code}/me`, { method: "POST", token, body: { name: $("#me-name").value, booth: $("#me-booth").value, medium: $("#me-medium").value, instagram: $("#me-ig").value } });
+      const body = { name: $("#me-name").value, booth: $("#me-booth").value, medium: $("#me-medium").value, instagram: $("#me-ig").value };
+      if ($("#me-phone")) { body.phone = $("#me-phone").value; body.email = $("#me-email").value; }
+      const r = await api(`/show/${code}/me`, { method: "POST", token, body });
       if (!r.ok) return toast(r.data.error || "Couldn't save. Check your signal.");
       S.me = r.data.me; toast("Saved"); sync(); return;
     }
@@ -900,6 +1006,12 @@ async function Buyer(code, artistId) {
     flushing = true;
     while (B.outbox.length) {
       const item = B.outbox[0];
+      if (item.photo && !s) break;
+      if (item.photo && s) {
+        const up = await uploadPhoto(code, s.token, item.photo);
+        if (!up.ok) { if (up.status === 0 || up.status >= 500) { B.online = up.status !== 0; break; } B.outbox.shift(); saveOutbox(); toast(up.data.error || "That photo couldn't be sent."); continue; }
+        item.meta = { img: up.data.id }; delete item.photo; saveOutbox();
+      }
       let r;
       if (!s) r = await api(`/show/${code}/buyer/start`, { method: "POST", body: { ...item, artist: artistId } });
       else r = await api(`/show/${code}/buyer/send`, { method: "POST", token: s.token, body: item });
@@ -918,7 +1030,7 @@ async function Buyer(code, artistId) {
   }
   function connect() {
     const s = sess(); if (!s || (ws && ws.readyState <= 1)) return;
-    ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/show/${code}/ws?t=${encodeURIComponent(s.token)}`);
+    ws = new WebSocket(`${WS_BASE}/api/show/${code}/ws?t=${encodeURIComponent(s.token)}`);
     ws.onopen = () => { backoff = 1000; sync(); flush(); ws.send(JSON.stringify({ t: "vis", v: document.visibilityState === "visible" })); };
     ws.onmessage = (e) => { if (e.data === "pong") return; try { const d = JSON.parse(e.data); if (d.t === "msg" && merge([d.m])) render(); } catch {} };
     ws.onclose = () => { ws = null; setTimeout(connect, backoff); backoff = Math.min(backoff * 2, 20000); };
@@ -938,10 +1050,43 @@ async function Buyer(code, artistId) {
   }
   function thread() {
     const items = B.messages.map((m) => {
+      if (m.kind === "move") return `<p class="sys moved">${esc(m.body.replace(/^.*? moved/, "You moved"))}</p>`;
       const mine = m.from !== artistId;
-      return `<div class="msg ${mine ? "me" : ""}">${mine ? "" : avatar(A(), "sm")}<div class="body"><div class="bubble">${m.meta && m.meta.piece ? `<b>About ${esc(m.meta.piece)}:</b> ` : ""}${linkify(m.body)}</div><span class="state">${mine ? "You" : esc(first())} · ${fmtDay(m.ts)} ${fmtTime(m.ts)}</span></div></div>`;
-    }).join("") + B.outbox.map((o) => `<div class="msg me pending"><div class="body"><div class="bubble">${linkify(o.body)}</div><span class="state">${B.online ? "Sending…" : "Waiting for signal, it'll send by itself"}</span></div></div>`).join("");
+      return `<div class="msg ${mine ? "me" : ""}">${mine ? "" : avatar(A(), "sm")}<div class="body">${m.meta && m.meta.img ? photoHtml(imgUrl(code, m.meta.img)) : ""}${m.body ? `<div class="bubble">${m.meta && m.meta.piece ? `<b>About ${esc(m.meta.piece)}:</b> ` : ""}${linkify(m.body)}</div>` : ""}<span class="state">${mine ? "You" : esc(first())} · ${fmtDay(m.ts)} ${fmtTime(m.ts)}</span></div></div>`;
+    }).join("") + B.outbox.map((o) => `<div class="msg me pending"><div class="body">${o.photo ? photoHtml(o.photo) : ""}${o.body ? `<div class="bubble">${linkify(o.body)}</div>` : ""}<span class="state">${B.online ? "Sending…" : "Waiting for signal, it'll send by itself"}</span></div></div>`).join("");
     return `<div class="msgs" style="padding:0">${items}</div>`;
+  }
+
+  function carryOn() {
+    const a = A(), b = B.buyer || {};
+    const opts = [];
+    if (a.phone || b.phone) opts.push(["text", a.phone ? `Text ${esc(first())}` : `Have ${esc(first())} text me`]);
+    if (a.email || b.email) opts.push(["email", a.email ? `Email ${esc(first())}` : `Have ${esc(first())} email me`]);
+    if (a.instagram) opts.push(["instagram", "Instagram DM"]);
+    if (!opts.length) return "";
+    return `<div class="card carry"><p class="label">Rather carry on somewhere else?</p>
+      <div class="btnrow">${opts.map(([k, l]) => `<button type="button" class="btn small ${k === "instagram" ? "igbtn" : "ghost"}" data-move="${k}">${l}</button>`).join("")}</div>
+      <label class="check"><input type="checkbox" id="move-all" checked> Bring the whole conversation, photos included</label></div>`;
+  }
+  async function moveTo(to) {
+    const a = A(), b = B.buyer || {}, s = sess();
+    const all = !!($("#move-all") && $("#move-all").checked);
+    const me = b.name || "a buyer";
+    const link = `${SITE}/b/${code}/${artistId}?k=${s.token}`;
+    const nameOf = (id) => (id === artistId ? a.name : b.name || "Me");
+    const txt = all
+      ? transcript(code, B.messages, nameOf, `Hi ${first()}, it's ${me} from your QR card at ${B.show ? B.show.name : "the show"}. Here's our conversation so far:`, `Our chat: ${link}`)
+      : `Hi ${first()}, it's ${me} from your QR card at ${B.show ? B.show.name : "the show"}.`;
+    api(`/show/${code}/buyer/move`, { method: "POST", token: s.token, body: { id: uid(), to, all } }).then((r) => { if (r.ok) { merge([r.data.message]); B.buyer = r.data.buyer; saveCache(); render(); } });
+    if (to === "instagram") {
+      try { navigator.clipboard.writeText(txt); } catch {}
+      window.open(`https://ig.me/m/${encodeURIComponent(a.instagram)}`, "_blank", "noopener");
+      toast(all ? "Conversation copied. Paste it into the Instagram chat." : "Opening Instagram");
+      return;
+    }
+    if (to === "text" && a.phone) { location.href = smsHref(a.phone, txt); return; }
+    if (to === "email" && a.email) { location.href = mailHref(a.email, `From ${me}: ${B.show ? B.show.name : "your QR card"}`, txt); return; }
+    toast(`Done. ${first()} will ${to === "text" ? "text" : "email"} you${all ? " the whole conversation" : ""}.`);
   }
 
   function render() {
@@ -971,9 +1116,10 @@ async function Buyer(code, artistId) {
           ${thread()}
           ${needContact && s ? `<form class="oq" id="contact"><p class="label" style="color:var(--accent)">Get ${esc(first())}'s reply by text</p><input class="input" id="c-phone" type="tel" autocomplete="tel" placeholder="Your phone" maxlength="30"><input class="input" id="c-email" type="email" autocomplete="email" placeholder="Or your email" maxlength="120"><button class="btn small">Save</button></form>` : ""}
           ${s && B.alerts !== "on" && pushSupported() ? `<button class="btn ghost small" id="b-alerts">Get a notification here when ${esc(first())} replies</button>` : ""}
+          ${s ? carryOn() : ""}
           ${s ? `<button class="btn ghost small" id="b-save">Save this conversation (copy your private link)</button>` : ""}
         </div></div>
-        <form class="composer" id="b-compose"><textarea class="input" rows="1" id="b-input" placeholder="Message ${esc(first())}" aria-label="Message"></textarea><button class="send" aria-label="Send">${ICON.send}</button></form>
+        <form class="composer" id="b-compose"><button class="photobtn" type="button" id="b-photo" aria-label="Send a photo">${PHOTO_ICON}</button><textarea class="input" rows="1" id="b-input" placeholder="Message ${esc(first())}" aria-label="Message"></textarea><button class="send" aria-label="Send">${ICON.send}</button></form>
       </section>`;
       const sc = $("#scroller"); if (sc) sc.scrollTop = sc.scrollHeight;
     }
@@ -997,11 +1143,17 @@ async function Buyer(code, artistId) {
     }
   });
   app.addEventListener("click", async (e) => {
+    const mv = e.target.closest("[data-move]");
+    if (mv) return moveTo(mv.dataset.move);
+    if (e.target.closest("#b-photo")) {
+      const photo = await pickPhoto(); if (!photo) return;
+      B.outbox.push({ id: uid(), body: "", photo }); saveOutbox(); render(); flush(); return;
+    }
     if (e.target.id === "b-alerts") {
       const r = await ensurePush(code, sess().token, { ask: true });
       B.alerts = r.ok ? "on" : "off"; toast(r.ok ? "You'll get a notification when they reply" : alertsHelp(r.reason)); render();
     }
-    if (e.target.id === "b-save") copyText(`${location.origin}/b/${code}/${artistId}?k=${sess().token}`, "Private link copied. Save it to come back to this chat.");
+    if (e.target.id === "b-save") copyText(`${SITE}/b/${code}/${artistId}?k=${sess().token}`, "Private link copied. Save it to come back to this chat.");
   });
 
   render();
@@ -1022,7 +1174,7 @@ async function Cards(code) {
   const only = q.get("only") === "me";
   const list = only ? data.members.filter((m) => m.id === data.me.id) : data.members.filter((m) => m.role === "artist");
   const showJoin = !only && data.me.role === "director";
-  const origin = location.origin;
+  const origin = SITE;
   const card = (m) => {
     const url = `${origin}/b/${code}/${m.id}`;
     return `<div class="qrcard"><span class="show">${esc(data.show.name)}</span><span class="qn">${esc(m.name)}</span>${m.booth ? `<span class="qb">Booth ${esc(m.booth)}</span>` : ""}

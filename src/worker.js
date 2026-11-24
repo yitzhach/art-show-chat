@@ -70,7 +70,7 @@ export default {
       return err("Couldn't create the show. Try again.", 500);
     }
 
-    const m = path.match(/^\/api\/show\/([A-Za-z0-9]{4,10})(\/[a-z/]*)$/);
+    const m = path.match(/^\/api\/show\/([A-Za-z0-9]{4,10})(\/[A-Za-z0-9/_-]*)$/);
     if (m) {
       const code = m[1].toUpperCase();
       const stub = env.SHOW.get(env.SHOW.idFromName(code));
@@ -128,7 +128,14 @@ export class ShowRoom extends DurableObject {
         kind TEXT, body TEXT, meta TEXT, ts INTEGER);
       CREATE INDEX IF NOT EXISTS messages_channel ON messages(channel, seq);
       CREATE TABLE IF NOT EXISTS subs (endpoint TEXT PRIMARY KEY, principal TEXT, data TEXT, created INTEGER);
+      CREATE TABLE IF NOT EXISTS images (id TEXT PRIMARY KEY, owner TEXT, type TEXT, size INTEGER, data BLOB, created INTEGER);
     `);
+    // Columns added after the first release.
+    for (const sql of [
+      "ALTER TABLE members ADD COLUMN phone TEXT DEFAULT ''",
+      "ALTER TABLE members ADD COLUMN email TEXT DEFAULT ''",
+      "ALTER TABLE buyers ADD COLUMN moved TEXT DEFAULT ''",
+    ]) { try { this.sql.exec(sql); } catch {} }
     try {
       ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     } catch {}
@@ -153,10 +160,10 @@ export class ShowRoom extends DurableObject {
     return this.sql.exec("SELECT * FROM buyers WHERE id = ?", id).toArray()[0] || null;
   }
   publicMember(m) {
-    return { id: m.id, name: m.name, booth: m.booth || "", medium: m.medium || "", instagram: m.instagram || "", role: m.role, active: m.last_active || 0 };
+    return { id: m.id, name: m.name, booth: m.booth || "", medium: m.medium || "", instagram: m.instagram || "", phone: m.phone || "", email: m.email || "", role: m.role, active: m.last_active || 0 };
   }
   publicBuyer(b, withKey = false) {
-    const out = { id: b.id, name: b.name || "", phone: b.phone || "", email: b.email || "", created: b.created, active: b.last_active || 0 };
+    const out = { id: b.id, name: b.name || "", phone: b.phone || "", email: b.email || "", moved: b.moved || "", created: b.created, active: b.last_active || 0 };
     // The artist's app gets the buyer's private link key so a text or email reply can take the buyer back to the chat.
     if (withKey) out.key = b.link_key || "";
     return out;
@@ -220,6 +227,7 @@ export class ShowRoom extends DurableObject {
       if (path === "/join" && method === "POST") return this.join(await readJson(req));
       if (path === "/buyer/start" && method === "POST") return this.buyerStart(await readJson(req), show);
       if (path === "/push/key") return json({ key: (await this.vapid()).publicKey });
+      if (path.startsWith("/img/")) return this.image(path.slice(5));
 
       const p = await this.principal(req, url);
       if (!p) return err("This sign-in isn't valid any more. Ask the show director for a new link.", 401);
@@ -227,11 +235,13 @@ export class ShowRoom extends DurableObject {
       if (path === "/ws") return this.ws(req, p);
       if (path === "/push/subscribe" && method === "POST") return this.subscribe(p, await readJson(req));
       if (path === "/push/unsubscribe" && method === "POST") return this.unsubscribe(p, await readJson(req));
+      if (path === "/upload" && method === "POST") return this.upload(p, req);
 
       if (p.type === "buyer") {
         if (path === "/buyer/sync") return this.buyerSync(p, Number(url.searchParams.get("since")) || 0, show);
         if (path === "/buyer/send" && method === "POST") return this.buyerSend(p, await readJson(req), show);
         if (path === "/buyer/me" && method === "POST") return this.buyerUpdate(p, await readJson(req));
+        if (path === "/buyer/move" && method === "POST") return this.buyerMove(p, await readJson(req), show);
         return err("Not found", 404);
       }
 
@@ -335,7 +345,9 @@ export class ShowRoom extends DurableObject {
     const booth = body.booth !== undefined ? clean(body.booth, LIMITS.booth) : me.booth;
     const medium = body.medium !== undefined ? clean(body.medium, LIMITS.medium) : me.medium;
     const instagram = body.instagram !== undefined ? cleanInstagram(body.instagram) : me.instagram;
-    this.sql.exec("UPDATE members SET name = ?, booth = ?, medium = ?, instagram = ? WHERE id = ?", name, booth, medium, instagram, me.id);
+    const phone = body.phone !== undefined ? clean(body.phone, LIMITS.phone) : me.phone;
+    const email = body.email !== undefined ? clean(body.email, LIMITS.email) : me.email;
+    this.sql.exec("UPDATE members SET name = ?, booth = ?, medium = ?, instagram = ?, phone = ?, email = ? WHERE id = ?", name, booth, medium, instagram, phone, email, me.id);
     return json({ me: this.publicMember(this.member(me.id)) });
   }
 
@@ -376,33 +388,41 @@ export class ShowRoom extends DurableObject {
     });
   }
 
+  photoMeta(body) {
+    const id = body.meta && typeof body.meta.img === "string" ? body.meta.img : "";
+    if (!id || !/^[A-Za-z0-9]{16,40}$/.test(id)) return null;
+    const row = this.sql.exec("SELECT id, type FROM images WHERE id = ?", id).toArray()[0];
+    return row ? { img: row.id } : null;
+  }
+
   async send(me, body, show) {
     const text = clean(body.body, LIMITS.body);
     const channel = String(body.channel || "");
     let kind = "text";
-    let meta = null;
+    let meta = this.photoMeta(body);
+    const hasContent = !!text || !!meta;
     if (channel === "ann") {
       if (me.role !== "director") return err("Only the show director can post announcements.", 403);
       if (!text) return err("Write the announcement first.");
       kind = "ann";
-      meta = { urgent: !!(body.meta && body.meta.urgent) };
+      meta = { ...(meta || {}), urgent: !!(body.meta && body.meta.urgent) };
     } else if (channel === "group") {
       if (body.kind === "ref") {
         const to = this.member(body.meta && body.meta.to);
         if (!to) return err("Pick who the buyer should go see.");
         kind = "ref";
         meta = { to: to.id, status: clean(body.meta.status, 40) };
-      } else if (!text) return err("Empty message.");
+      } else if (!hasContent) return err("Empty message.");
     } else if (channel.startsWith("dm:")) {
       const ids = channel.slice(3).split(":");
       if (ids.length !== 2 || !ids.includes(me.id)) return err("You can't post there.", 403);
       const other = ids[0] === me.id ? ids[1] : ids[0];
       if (!this.member(other) || ids[0] > ids[1]) return err("You can't post there.", 403);
-      if (!text) return err("Empty message.");
+      if (!hasContent) return err("Empty message.");
     } else if (channel.startsWith("buy:")) {
       const b = this.buyer(channel.slice(4));
       if (!b || b.artist_id !== me.id) return err("You can't post there.", 403);
-      if (!text) return err("Empty message.");
+      if (!hasContent) return err("Empty message.");
     } else {
       return err("You can't post there.", 403);
     }
@@ -470,9 +490,10 @@ export class ShowRoom extends DurableObject {
     const b = this.buyer(p.id);
     if (!this.member(b.artist_id)) return err("This artist isn't in the show chat any more.", 404);
     const text = clean(body.body, LIMITS.body);
-    if (!text) return err("Write a message first.");
+    const meta = this.photoMeta(body);
+    if (!text && !meta) return err("Write a message first.");
     const before = this.maxSeq();
-    const { msg } = this.insertMessage({ id: body.id, channel: "buy:" + b.id, sender: b.id, kind: "text", body: text });
+    const { msg } = this.insertMessage({ id: body.id, channel: "buy:" + b.id, sender: b.id, kind: "text", body: text, meta });
     if (msg.seq > before) this.notify(msg, show);
     return json({ message: msg });
   }
@@ -542,6 +563,8 @@ export class ShowRoom extends DurableObject {
     const base = `/s/${this.code}`;
     const snip = (s) => (s.length > 140 ? s.slice(0, 137) + "…" : s);
     if (msg.kind === "system") return null;
+    if (!msg.body && msg.meta && msg.meta.img) msg = { ...msg, body: "Sent a photo" };
+    if (msg.kind === "move") return { title: `${senderName} moved to ${msg.meta.to === "text" ? "text" : msg.meta.to}`, body: snip(msg.body), url: base + "#" + msg.ch, tag: "buy-" + msg.ch.slice(4), urgent: true };
     if (msg.ch === "ann") {
       return { title: (msg.meta && msg.meta.urgent ? "Urgent: " : "") + show.name, body: snip(msg.body), url: base + "#group", tag: "ann-" + msg.seq, urgent: !!(msg.meta && msg.meta.urgent) };
     }
@@ -587,6 +610,42 @@ export class ShowRoom extends DurableObject {
       }
     }
     await Promise.allSettled(jobs);
+  }
+
+  // ---------- photos ----------
+  async upload(p, req) {
+    const type = (req.headers.get("content-type") || "").split(";")[0].trim();
+    if (!["image/jpeg", "image/png", "image/webp", "image/gif"].includes(type)) return err("Send a photo (JPEG, PNG, WebP or GIF).");
+    const buf = await req.arrayBuffer();
+    if (!buf.byteLength) return err("That photo was empty.");
+    if (buf.byteLength > 1900000) return err("That photo is too big. Try a smaller one.", 413);
+    const recent = this.sql.exec("SELECT COUNT(*) AS n FROM images WHERE owner = ? AND created > ?", p.id, Date.now() - 3600e3).one().n;
+    if (recent > 120) return err("Too many photos in the last hour.", 429);
+    const id = newToken().slice(0, 24);
+    this.sql.exec("INSERT INTO images (id, owner, type, size, data, created) VALUES (?, ?, ?, ?, ?, ?)", id, p.id, type, buf.byteLength, buf, Date.now());
+    return json({ id, url: `/api/show/${this.code}/img/${id}` });
+  }
+  image(id) {
+    if (!/^[A-Za-z0-9]{16,40}$/.test(id)) return err("Not found", 404);
+    const row = this.sql.exec("SELECT type, data FROM images WHERE id = ?", id).toArray()[0];
+    if (!row) return err("Not found", 404);
+    return new Response(row.data, { headers: { "content-type": row.type, "cache-control": "public, max-age=31536000, immutable" } });
+  }
+
+  // A buyer chose to carry on by text, email or Instagram. The artist sees a note in the chat.
+  buyerMove(p, body, show) {
+    const b = this.buyer(p.id);
+    const to = ["text", "email", "instagram"].includes(body.to) ? body.to : null;
+    if (!to) return err("Pick text, email or Instagram.");
+    this.sql.exec("UPDATE buyers SET moved = ? WHERE id = ?", to, b.id);
+    const who = b.name || "This buyer";
+    const label = { text: "text message", email: "email", instagram: "Instagram" }[to];
+    const { msg } = this.insertMessage({
+      id: body.id, channel: "buy:" + b.id, sender: b.id, kind: "move",
+      body: `${who} moved this conversation to ${label}${body.all ? " and took the whole thread with them" : ""}.`, meta: { to, all: !!body.all },
+    });
+    this.notify(msg, show);
+    return json({ message: msg, buyer: this.publicBuyer(this.buyer(b.id)) });
   }
 
   subscribe(p, body) {
