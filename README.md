@@ -18,6 +18,16 @@ One Cloudflare Worker serves the app (`public/`) and the API (`src/worker.js`). 
 
 Connect this repo to Cloudflare Workers (Workers & Pages, Create, Import a repository). Name the Worker `art-show-chat` to match `wrangler.jsonc`, and keep the default build settings (deploy command `npx wrangler deploy`). Every push to `main` deploys.
 
+## Email (optional, free with Resend)
+
+Email stays off until you add secrets to the Worker in Cloudflare (Workers & Pages > art-show-chat > Settings > Variables and Secrets, type Secret). Secrets survive every deploy.
+
+- `RESEND_API_KEY`: an API key from resend.com.
+- `OWNER_EMAIL`: your own address. You get every buyer's first message (then at most one email per buyer every 5 minutes) and every "text me" or "email me" request, with the conversation and a Text button. This works with Resend's test sender, as long as it's the address your Resend account is under.
+- `MAIL_FROM` (later): a sender on a domain verified in Resend, such as `Show Chat <chat@yourdomain.com>`. With it, Show Chat also emails buyers their private link and each artist reply, sends "email me" conversations, and emails artists who haven't turned on app alerts.
+
+Test it locally with `npm run test:mail`, which uses a fake Resend server.
+
 ## Develop
 
 ```

@@ -2,6 +2,7 @@
 // Each show lives in its own SQLite-backed Durable Object, so there is no database to set up.
 import { DurableObject } from "cloudflare:workers";
 import { generateVapidKeys, sendPush } from "./webpush.js";
+import { mailReady, ownerMailReady, renderMail, sendMail } from "./mail.js";
 
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const LIMITS = { name: 60, booth: 12, medium: 80, body: 2000, phone: 30, email: 120, venue: 120, dates: 80 };
@@ -263,7 +264,7 @@ export class ShowRoom extends DurableObject {
 
   showInfo(show) {
     const artists = this.sql.exec("SELECT COUNT(*) AS n FROM members WHERE removed = 0 AND role = 'artist'").one().n;
-    return { code: this.code, name: show.name, venue: show.venue || "", dates: show.dates || "", artists };
+    return { code: this.code, name: show.name, venue: show.venue || "", dates: show.dates || "", artists, mail: mailReady(this.env) };
   }
 
   async init(body) {
@@ -555,6 +556,161 @@ export class ShowRoom extends DurableObject {
     }
     const pushTo = recipients.filter((id) => !visible.has(id));
     if (pushTo.length) this.ctx.waitUntil(this.push(msg, pushTo, show));
+    if (mailReady(this.env)) this.ctx.waitUntil(this.mailFor(msg, show, visible).catch((e) => console.warn("mail", String(e))));
+    if (ownerMailReady(this.env)) this.ctx.waitUntil(this.mailOwner(msg, show).catch((e) => console.warn("owner mail", String(e))));
+  }
+
+  // ---------- owner copy: buyer messages and carry-on requests go to OWNER_EMAIL ----------
+  async mailOwner(msg, show) {
+    if (!msg.ch.startsWith("buy:") || msg.from !== msg.ch.slice(4)) return;
+    if (msg.kind !== "text" && msg.kind !== "move") return;
+    const b = this.buyer(msg.from);
+    const artist = b && this.member(b.artist_id);
+    if (!b || !artist) return;
+    // Every carry-on request is sent; ordinary messages at most once per buyer every 5 minutes.
+    if (msg.kind === "text" && this.mailThrottled("o:" + b.id, 5 * 60e3)) return;
+    const who = b.name || "A buyer";
+    const at = `${artist.name}${artist.booth ? ` (Booth ${artist.booth})` : ""}`;
+    const contact = [b.phone ? `Phone: ${b.phone}` : "", b.email ? `Email: ${b.email}` : ""].filter(Boolean);
+    const move = msg.kind === "move" ? msg.meta.to : "";
+    const rows = move
+      ? this.sql.exec("SELECT * FROM messages WHERE channel = ? ORDER BY seq", msg.ch).toArray()
+      : this.sql.exec("SELECT * FROM messages WHERE channel = ? AND seq <= ? ORDER BY seq DESC LIMIT 6", msg.ch, msg.seq).toArray().reverse();
+    const tel = b.phone.replace(/[^\d+]/g, "");
+    const intro = move === "text"
+      ? `${who} asked ${at} to text them${b.phone ? ` at ${b.phone}` : ", but didn't leave a phone number"}.`
+      : move === "email"
+        ? `${who} asked ${at} to carry on by email${b.email ? ` at ${b.email}` : ""}.`
+        : move === "instagram"
+          ? `${who} is carrying on with ${at} on Instagram.`
+          : `${who} messaged ${at} from the QR card at ${show.name}.`;
+    const m = renderMail({
+      intro,
+      blocks: this.mailBlocks(rows, b, artist),
+      cta: tel ? `Text ${who}` : "",
+      ctaUrl: tel ? `sms:${tel}` : "",
+      footer: [...contact, `Show: ${show.name} (code ${this.code})`],
+    });
+    const subject = move ? `${who} wants ${move === "text" ? "a text" : move === "email" ? "an email" : "Instagram"} · ${artist.name}` : `Buyer message for ${artist.name}`;
+    await sendMail(this.env, { owner: true, subject, ...m, replyTo: b.email, tag: move ? "owner-move" : "owner-msg" });
+  }
+
+  // ---------- automatic email (only when RESEND_API_KEY and MAIL_FROM are set) ----------
+  buyerLink(b) {
+    return `${this.origin}/b/${this.code}/${b.artist_id}?k=${b.link_key}`;
+  }
+  mailBlocks(rows, b, artist) {
+    return rows
+      .filter((r) => r.kind === "text")
+      .map((r) => {
+        const meta = r.meta ? JSON.parse(r.meta) : null;
+        return {
+          who: r.sender === artist.id ? artist.name : b.name || "You",
+          text: (meta && meta.piece ? `About ${meta.piece}: ` : "") + (r.body || ""),
+          img: meta && meta.img ? `${this.origin}/api/show/${this.code}/img/${meta.img}` : "",
+        };
+      });
+  }
+  hasPush(id) {
+    return this.sql.exec("SELECT COUNT(*) AS n FROM subs WHERE principal = ?", id).one().n > 0;
+  }
+  // At most one email per key in the window, so a quick back-and-forth doesn't flood an inbox.
+  mailThrottled(key, ms) {
+    const last = this.kvGet("mail:" + key) || 0;
+    if (Date.now() - last < ms) return true;
+    this.kvSet("mail:" + key, Date.now());
+    return false;
+  }
+  async mailFor(msg, show, visible) {
+    const env = this.env;
+    const where = (a) => [a.booth ? `Booth ${a.booth}` : "", show.name].filter(Boolean).join(", ");
+    const first = (n) => String(n || "the artist").split(/\s+/)[0];
+    const jobs = [];
+
+    if (msg.ch.startsWith("buy:")) {
+      const b = this.buyer(msg.ch.slice(4));
+      const artist = b && this.member(b.artist_id);
+      if (!b || !artist) return;
+      const link = this.buyerLink(b);
+      const artistLink = `${this.origin}/s/${this.code}#buy:${b.id}`;
+      const thisRow = this.sql.exec("SELECT * FROM messages WHERE seq = ?", msg.seq).toArray();
+
+      if (msg.from === artist.id && msg.kind === "text" && b.email && !visible.has(b.id)) {
+        // The artist replied and the buyer isn't looking at the page: email the reply.
+        const m = renderMail({
+          intro: `${artist.name} (${where(artist)}) replied to your message:`,
+          blocks: this.mailBlocks(thisRow, b, artist),
+          cta: "Open the conversation",
+          ctaUrl: link,
+          footer: [artist.email ? `Reply to this email to reach ${first(artist.name)} directly, or keep chatting at the link.` : "Keep chatting at the link. Replies to this email aren't read."],
+        });
+        jobs.push(sendMail(env, { to: b.email, subject: `${artist.name} replied`, ...m, replyTo: artist.email, tag: "reply" }));
+      }
+
+      if (msg.from === b.id) {
+        const count = this.sql.exec("SELECT COUNT(*) AS n FROM messages WHERE channel = ? AND kind = 'text'", msg.ch).one().n;
+        if (msg.kind === "text" && count === 1 && b.email) {
+          // First message: give the buyer their private link so they can always get back to the chat.
+          const m = renderMail({
+            intro: `Your message reached ${artist.name} (${where(artist)}). Their reply will come to this email, and you can keep chatting at your private link.`,
+            blocks: this.mailBlocks(thisRow, b, artist),
+            cta: "Open the conversation",
+            ctaUrl: link,
+            footer: ["This link is private to you. Keep it to come back to the conversation."],
+          });
+          jobs.push(sendMail(env, { to: b.email, subject: `Your message to ${artist.name}`, ...m, replyTo: artist.email, tag: "confirm" }));
+        }
+        if (msg.kind === "move" && msg.meta && msg.meta.to === "email") {
+          const rows = msg.meta.all
+            ? this.sql.exec("SELECT * FROM messages WHERE channel = ? ORDER BY seq", msg.ch).toArray()
+            : this.sql.exec("SELECT * FROM messages WHERE channel = ? AND kind = 'text' ORDER BY seq DESC LIMIT 1", msg.ch).toArray();
+          const blocks = this.mailBlocks(rows, b, artist);
+          if (b.email) {
+            const m = renderMail({
+              intro: `Here's your conversation with ${artist.name} (${where(artist)}).${artist.email ? ` Reply to this email to carry on with ${first(artist.name)} directly.` : ""}`,
+              blocks, cta: "Open the conversation", ctaUrl: link,
+              footer: artist.email ? [] : [`${first(artist.name)} will reply by email.`],
+            });
+            jobs.push(sendMail(env, { to: b.email, subject: `Your conversation with ${artist.name}`, ...m, replyTo: artist.email, tag: "move" }));
+          }
+          if (artist.email) {
+            const m = renderMail({
+              intro: `${b.name || "A buyer"} from your QR card asked to carry on by email.${b.email ? " Reply to this email to answer them directly." : " They didn't leave an email, so reply in Show Chat."}`,
+              blocks, cta: "Open in Show Chat", ctaUrl: artistLink,
+            });
+            jobs.push(sendMail(env, { to: artist.email, subject: `${b.name || "A buyer"} wants to carry on by email`, ...m, replyTo: b.email, tag: "move-artist" }));
+          }
+        } else if (artist.email && !visible.has(artist.id) && !this.hasPush(artist.id) && !this.mailThrottled("a:" + b.id, 10 * 60e3)) {
+          // The artist has no app alerts set up: email them about the buyer instead.
+          const m = renderMail({
+            intro: msg.kind === "move" ? `${b.name || "A buyer"} from your QR card wants to carry on by ${msg.meta.to === "text" ? "text" : msg.meta.to}.` : `${b.name || "A buyer"} sent you a message from your QR card:`,
+            blocks: this.mailBlocks(thisRow, b, artist),
+            cta: "Reply in Show Chat",
+            ctaUrl: artistLink,
+            footer: [b.email ? "Reply to this email to answer them by email instead." : "Turn on alerts in Show Chat to get these on your phone."],
+          });
+          jobs.push(sendMail(env, { to: artist.email, subject: `Buyer message from ${b.name || "your QR card"}`, ...m, replyTo: b.email, tag: "artist-alert" }));
+        }
+      }
+    } else if ((msg.kind === "ref" && msg.meta && msg.meta.to) || (msg.ch === "ann" && msg.meta && msg.meta.urgent)) {
+      // Time-sensitive: email artists who can't get app alerts.
+      const ids = msg.kind === "ref" ? [msg.meta.to] : this.recipients(msg);
+      const sender = this.member(msg.from);
+      for (const id of ids) {
+        const a = this.member(id);
+        if (!a || !a.email || visible.has(id) || this.hasPush(id)) continue;
+        const isRef = msg.kind === "ref";
+        const m = renderMail({
+          intro: isRef ? `${sender ? sender.name : "Another artist"}${sender && sender.booth ? ` (Booth ${sender.booth})` : ""} is sending a buyer your way.` : `Urgent announcement from ${show.name}:`,
+          blocks: msg.body ? [{ who: sender ? sender.name : show.name, text: msg.body + (isRef && msg.meta.status ? ` · ${msg.meta.status}` : "") }] : [],
+          cta: "Open Show Chat",
+          ctaUrl: `${this.origin}/s/${this.code}#group`,
+          footer: ["Turn on alerts in Show Chat to get these on your phone."],
+        });
+        jobs.push(sendMail(env, { to: a.email, subject: isRef ? "Buyer heading your way" : `Urgent: ${show.name}`, ...m, tag: isRef ? "ref" : "ann" }));
+      }
+    }
+    await Promise.allSettled(jobs);
   }
 
   pushContent(msg, to, show) {

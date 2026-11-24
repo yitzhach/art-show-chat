@@ -689,14 +689,15 @@ function ChatApp(code, sess) {
     const tel = b.phone.replace(/[^\d+]/g, "");
     const contact = (b.phone ? `<a href="sms:${esc(tel)}">Text ${esc(b.phone)}</a><a href="tel:${esc(tel)}">Call</a>` : "") + (b.email ? `<a href="mailto:${esc(b.email)}">Email ${esc(b.email)}</a>` : "");
     const movedLabel = { text: "text", email: "email", instagram: "Instagram" }[b.moved];
-    const canSend = (b.moved === "text" && b.phone) || (b.moved === "email" && b.email);
-    const moved = b.moved ? `<div class="followup"><span><b>${esc(b.name || "This buyer")} wants to carry on by ${movedLabel}.</b> ${canSend ? "Send them the whole conversation from your phone in one tap:" : b.moved === "instagram" ? `Look for their message in your Instagram DMs${S.me.instagram ? "" : " (add your Instagram handle under You so buyers can find you)"}.` : "They didn't leave the details for that, so reply here."}</span>${canSend ? `<div class="btnrow"><button class="btn small" data-act="send-thread" data-id="${esc(bid)}" data-via="${b.moved}">${b.moved === "text" ? "Text" : "Email"} the whole conversation</button></div>` : ""}</div>` : "";
+    const autoMail = !!(S.show.mail && b.email);
+    const canSend = (b.moved === "text" && b.phone) || (b.moved === "email" && b.email && !autoMail);
+    const moved = b.moved ? `<div class="followup"><span><b>${esc(b.name || "This buyer")} wants to carry on by ${movedLabel}.</b> ${canSend ? "Send them the whole conversation from your phone in one tap:" : b.moved === "email" && autoMail ? "Show Chat emailed them the conversation, and your replies here go to their email too." : b.moved === "instagram" ? `Look for their message in your Instagram DMs${S.me.instagram ? "" : " (add your Instagram handle under You so buyers can find you)"}.` : "They didn't leave the details for that, so reply here."}</span>${canSend ? `<div class="btnrow"><button class="btn small" data-act="send-thread" data-id="${esc(bid)}" data-via="${b.moved}">${b.moved === "text" ? "Text" : "Email"} the whole conversation</button></div>` : ""}</div>` : "";
     let follow = "";
-    if (S.followup && S.followup.bid === bid && (b.phone || b.email)) {
+    if (S.followup && S.followup.bid === bid && (b.phone || (b.email && !autoMail))) {
       const msg = `${S.followup.text}\n\n— ${S.me.name}${S.me.booth ? ", Booth " + S.me.booth : ""}, ${S.show.name}\nKeep chatting here: ${buyerLink(b)}`;
-      follow = `<div class="followup"><span>Also send it to ${esc(b.name || "them")} by ${b.phone ? "text" : "email"} so they see it right away:</span><div class="btnrow">
+      follow = `<div class="followup"><span>${autoMail ? `Emailed to ${esc(b.name || "them")}. ` : ""}Also send it by ${b.phone ? "text" : "email"} so they see it right away:</span><div class="btnrow">
         ${b.phone ? `<a class="btn small" href="sms:${esc(tel)}?&body=${encodeURIComponent(msg)}" data-act="followed">Text it</a>` : ""}
-        ${b.email ? `<a class="btn small ${b.phone ? "ghost" : ""}" href="mailto:${esc(b.email)}?subject=${encodeURIComponent("Your message at " + S.show.name)}&body=${encodeURIComponent(msg)}" data-act="followed">Email it</a>` : ""}
+        ${b.email && !autoMail ? `<a class="btn small ${b.phone ? "ghost" : ""}" href="mailto:${esc(b.email)}?subject=${encodeURIComponent("Your message at " + S.show.name)}&body=${encodeURIComponent(msg)}" data-act="followed">Email it</a>` : ""}
         <button class="btn small ghost" data-act="followed">Skip</button></div></div>`;
     }
     return `<section class="screen">${subBar(esc(b.name || "Visitor"), "Buyer · from your QR card")}
@@ -760,7 +761,7 @@ function ChatApp(code, sess) {
           ${me.role === "artist" ? `<p class="label" style="margin-top:4px">How buyers can reach you outside the app (optional)</p>
           <div class="row2"><div class="field"><label class="label" for="me-phone">Phone for texts</label><input class="input" id="me-phone" type="tel" value="${esc(me.phone || "")}" maxlength="30" autocomplete="tel"></div>
           <div class="field"><label class="label" for="me-email">Email</label><input class="input" id="me-email" type="email" value="${esc(me.email || "")}" maxlength="120" autocomplete="email"></div></div>
-          <p class="small">If you add these, buyers on your QR page get one-tap buttons to move the chat to text or email, with the whole conversation.</p>` : ""}
+          <p class="small">If you add these, buyers on your QR page get one-tap buttons to move the chat to text or email, with the whole conversation.${S.show.mail ? " Your email also gets buyer messages whenever alerts aren't on for this phone." : ""}</p>` : ""}
           <button class="btn ghost">Save</button></form>
         <div class="card"><h3>Alerts</h3>
           ${S.alerts === "on" ? `<p class="hint">Alerts are on for this phone. You'll get buyer messages, referrals, direct messages and announcements.</p><div class="btnrow"><button class="btn small ghost" data-act="test-alert">Send me a test alert</button></div>`
@@ -1067,7 +1068,8 @@ async function Buyer(code, artistId) {
     const a = A(), b = B.buyer || {};
     const opts = [];
     if (a.phone || b.phone) opts.push(["text", a.phone ? `Text ${esc(first())}` : `Have ${esc(first())} text me`]);
-    if (a.email || b.email) opts.push(["email", a.email ? `Email ${esc(first())}` : `Have ${esc(first())} email me`]);
+    const autoMail = B.show && B.show.mail && b.email;
+    if (a.email || b.email) opts.push(["email", autoMail ? "Carry on by email" : a.email ? `Email ${esc(first())}` : `Have ${esc(first())} email me`]);
     if (a.instagram) opts.push(["instagram", "Instagram DM"]);
     if (!opts.length) return "";
     return `<div class="card carry"><p class="label">Rather carry on somewhere else?</p>
@@ -1090,6 +1092,7 @@ async function Buyer(code, artistId) {
       toast(all ? "Conversation copied. Paste it into the Instagram chat." : "Opening Instagram");
       return;
     }
+    if (to === "email" && B.show && B.show.mail && b.email) { toast(`Sent to ${b.email}. ${first()}'s replies will come there too.`); return; }
     if (to === "text" && a.phone) { location.href = smsHref(a.phone, txt); return; }
     if (to === "email" && a.email) { location.href = mailHref(a.email, `From ${me}: ${B.show ? B.show.name : "your QR card"}`, txt); return; }
     toast(`Done. ${first()} will ${to === "text" ? "text" : "email"} you${all ? " the whole conversation" : ""}.`);
@@ -1110,7 +1113,7 @@ async function Buyer(code, artistId) {
           <div class="field"><label class="label" for="b-phone">Your phone, for a text back</label><input class="input" id="b-phone" type="tel" autocomplete="tel" maxlength="30" placeholder="(305) 555-0100"></div>
           <div class="field"><label class="label" for="b-email">Or your email</label><input class="input" id="b-email" type="email" autocomplete="email" maxlength="120" placeholder="you@email.com"></div>
           <div class="field"><label class="label" for="b-name">Your name</label><input class="input" id="b-name" autocomplete="name" maxlength="60"></div>
-          <p class="small">Both are optional. Replies also show on this page, and you can keep chatting here any time.</p></div>
+          <p class="small">Both are optional. ${B.show && B.show.mail ? "If you add an email, replies come there too, and they" : "Replies"} also show on this page, so you can keep chatting here any time.</p></div>
         <button class="btn" id="b-go">Send to ${esc(first())}</button>
         ${igButton() ? `<div class="or">or</div>${igButton()}` : ""}
         <p class="small" style="text-align:center">No account or app needed. Only ${esc(first())} sees your message.</p>
