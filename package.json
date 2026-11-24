@@ -7,7 +7,8 @@
     "deploy": "wrangler deploy",
     "test": "node test/webpush.test.mjs && node test/e2e.test.mjs",
     "test:mail": "node test/mail.test.mjs",
-    "test:load": "node test/load.test.mjs"
+    "test:load": "node test/load.test.mjs",
+    "test:visitor": "node test/visitor.test.mjs && node test/visitor-ui.test.mjs"
   },
   "author": "",
   "license": "ISC",

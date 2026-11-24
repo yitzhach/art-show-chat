@@ -50,7 +50,17 @@ async function scenario(vars, label, check) {
     const afterReply = sent.slice();
     await j(`/api/show/${show}/buyer/move`, { method: "POST", t: s.data.token, body: { id: "mv" + code, to: "text", all: true } });
     await wait(600);
-    await check({ info: info.data, afterStart, afterReply, all: sent.slice() });
+    // Favorites recap: a visitor hearts a piece and asks for the recap; the director presses send.
+    const img = (await (await fetch(`${B}/api/show/${show}/upload`, { method: "POST", headers: { "content-type": "image/jpeg", authorization: "Bearer " + a.data.token }, body: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]) })).json()).id;
+    await j(`/api/show/${show}/gallery`, { method: "POST", t: a.data.token, body: { pieces: [{ id: "pvase00001", img, title: "Tall blue vase", price: "$1,800" }] } });
+    const v = (await j(`/api/show/${show}/visitor/start`, { method: "POST", body: {} })).data;
+    await j(`/api/show/${show}/visitor/fav`, { method: "POST", t: v.token, body: { type: "piece", artist: a.data.me.id, piece: "pvase00001" } });
+    await j(`/api/show/${show}/visitor/me`, { method: "POST", t: v.token, body: { email: "visitor@example.com", recap: true } });
+    const before = sent.length;
+    const recap1 = await j(`/api/show/${show}/recap/send`, { method: "POST", t: c.data.token });
+    const recap2 = await j(`/api/show/${show}/recap/send`, { method: "POST", t: c.data.token });
+    const recapMail = sent.slice(before);
+    await check({ info: info.data, afterStart, afterReply, all: sent.slice(), recap1, recap2, recapMail });
   } finally {
     try { process.kill(-w.pid); } catch { w.kill(); }
     await wait(800);
@@ -70,8 +80,11 @@ await scenario({ OWNER_EMAIL: "owner@example.com" }, "owner only", async ({ info
   ok(!!mv && /Yes it is!/.test(mv.text), "text-me email carries the whole conversation");
   ok(all.every((m) => m.auth === "Bearer re_test"), "uses the API key");
 });
+await scenario({ OWNER_EMAIL: "owner@example.com" }, "recap off", async ({ recap1, recapMail }) => {
+  ok(recap1.status === 409 && recapMail.length === 0, "with only the owner email set up, recap emails stay off and nothing is sent");
+});
 
-await scenario({ MAIL_FROM: "Show Chat <chat@example.com>" }, "full", async ({ info, afterStart, afterReply }) => {
+await scenario({ MAIL_FROM: "Show Chat <chat@example.com>" }, "full", async ({ info, afterStart, afterReply, recap1, recap2, recapMail }) => {
   ok(info.show.mail === true, "with a verified sender, the app knows email is on");
   const confirm = afterStart.find((m) => m.to[0] === "pat@example.com");
   ok(!!confirm && /\/b\/.+\?k=/.test(confirm.text), "buyer gets a confirmation with their private link");
@@ -81,6 +94,9 @@ await scenario({ MAIL_FROM: "Show Chat <chat@example.com>" }, "full", async ({ i
   const reply = afterReply.find((m) => m.to[0] === "pat@example.com" && /replied/.test(m.subject));
   ok(!!reply && /Yes it is!/.test(reply.text), "buyer gets the artist's reply by email");
   ok(afterReply.every((m) => m.from === "Show Chat <chat@example.com>"), "sends from the verified sender");
+  const r = recapMail.find((m) => m.to[0] === "visitor@example.com");
+  ok(recap1.status === 200 && recap1.data.sent === 1 && !!r && /Tall blue vase · \$1,800/.test(r.text) && /\/v\/.+\?k=.+#saved/.test(r.text), "with email set up, the director's send emails the visitor's favorites with prices and a link back");
+  ok(recap2.data.sent === 0 && recapMail.filter((m) => m.to[0] === "visitor@example.com").length === 1, "each visitor gets the recap only once");
 });
 
 mock.close();
