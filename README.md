@@ -7,6 +7,7 @@ A show chat for art fair exhibitors, show directors and their buyers. Beta 1.0, 
 - **Refer a buyer:** send a buyer to another artist, who gets a heads-up alert.
 - **Announcements:** the director posts to every exhibitor. Urgent ones stay pinned, with a count of how many phones each one reached.
 - **Buyer QR cards:** each artist has a printable card. Buyers scan it and message the artist with no app or account, and can keep the conversation going later. Phone (for a text back) is asked first, then email. Artists can also link their Instagram.
+- **Booth and pieces:** once the booth is set up, an artist adds booth shots and a photo of each piece (title, price, sold). Buyers who scan the card see them at the top of the chat and can tap a piece to ask about it, so the artist sees exactly which piece the message is about.
 - **Bad signal:** messages queue on the phone and send by themselves when signal returns. The app opens offline.
 - **Alerts:** web push on Android and desktop, and on iPhone once Show Chat is added to the Home Screen (iOS 16.4+).
 
@@ -35,10 +36,11 @@ npm install
 npm run dev
 ```
 
-Then, with the dev server running, `npm test` runs the push encryption check and the end-to-end API checks, and `node test/ui.test.mjs` runs the screen checks.
+Then, with the dev server running, `npm test` runs the push encryption check and the end-to-end API checks, `node test/ui.test.mjs` runs the screen checks, and `node test/gallery.test.mjs` checks booth and piece photos.
 
 ## Using it
 
 1. Director: open the site, tap **Start a show chat**, pick a show code (for example `REDDOT`).
 2. Share the invite. Artists open the link or type the code, then add their name, booth and Instagram.
-3. Print QR cards from **You → Print QR cards for all artists** (four per letter page).
+3. Each artist adds booth and piece photos from **Buyers → Booth and pieces** once they're set up.
+4. Print QR cards from **You → Print QR cards for all artists** (four per letter page).

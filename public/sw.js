@@ -1,6 +1,6 @@
 // Service worker: keeps the app opening with no signal, and shows push alerts.
-const CACHE = "showchat-v5";
-const SHELL = ["/", "/style.css?v=5", "/app.js?v=5", "/vendor/qrcode.js", "/icon-192.png", "/badge-96.png", "/apple-touch-icon.png"];
+const CACHE = "showchat-v6";
+const SHELL = ["/", "/style.css?v=6", "/app.js?v=6", "/vendor/qrcode.js", "/icon-192.png", "/badge-96.png", "/apple-touch-icon.png"];
 
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

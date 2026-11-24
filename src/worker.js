@@ -180,6 +180,45 @@ export class ShowRoom extends DurableObject {
     if (withKey) out.key = b.link_key || "";
     return out;
   }
+  // ---------- booth photos and pieces: each artist's little catalog for the QR page ----------
+  gallery(memberId) {
+    const g = this.kvGet("gal:" + memberId) || {};
+    return { booth: Array.isArray(g.booth) ? g.booth : [], pieces: Array.isArray(g.pieces) ? g.pieces : [], updated: g.updated || 0 };
+  }
+  galleryPiece(memberId, pieceId) {
+    if (typeof pieceId !== "string" || !pieceId) return null;
+    return this.gallery(memberId).pieces.find((x) => x.id === pieceId) || null;
+  }
+  pieceMeta(memberId, body) {
+    const pc = this.galleryPiece(memberId, body.pieceId);
+    if (pc) return { piece: pc.title || "this piece", pieceId: pc.id, pimg: pc.thumb || pc.img };
+    return body.piece ? { piece: clean(body.piece, 80) } : null;
+  }
+  saveGallery(me, body) {
+    const ownImg = (id) => typeof id === "string" && /^[A-Za-z0-9]{16,40}$/.test(id) && this.sql.exec("SELECT COUNT(*) AS n FROM images WHERE id = ? AND owner = ?", id, me.id).one().n > 0;
+    const shot = (x) => (x && ownImg(x.img) ? { img: x.img, thumb: ownImg(x.thumb) ? x.thumb : x.img } : null);
+    const booth = (Array.isArray(body.booth) ? body.booth : []).slice(0, 8).map(shot).filter(Boolean);
+    const seen = new Set();
+    const pieces = (Array.isArray(body.pieces) ? body.pieces : []).slice(0, 40).map((x) => {
+      const base = shot(x);
+      if (!base) return null;
+      let id = typeof x.id === "string" && /^p[a-z0-9]{4,16}$/.test(x.id) ? x.id : "p" + newToken().slice(0, 10).toLowerCase();
+      if (seen.has(id)) id = "p" + newToken().slice(0, 10).toLowerCase();
+      seen.add(id);
+      return { id, ...base, title: clean(x.title, 60), price: clean(x.price, 30), note: clean(x.note, 120), sold: !!x.sold };
+    }).filter(Boolean);
+    const g = { booth, pieces, updated: Date.now() };
+    this.kvSet("gal:" + me.id, g);
+    // Buyers who have this artist's page open see the new photos right away.
+    const ids = new Set(this.sql.exec("SELECT id FROM buyers WHERE artist_id = ?", me.id).toArray().map((r) => r.id));
+    const payload = JSON.stringify({ t: "gallery", g });
+    for (const ws of this.ctx.getWebSockets()) {
+      const att = ws.deserializeAttachment() || {};
+      if (ids.has(att.p)) try { ws.send(payload); } catch {}
+    }
+    return json({ gallery: g });
+  }
+
   rowToMsg(r) {
     return { seq: r.seq, id: r.id, ch: r.channel, from: r.sender, kind: r.kind, body: r.body, meta: r.meta ? JSON.parse(r.meta) : null, ts: r.ts };
   }
@@ -260,6 +299,7 @@ export class ShowRoom extends DurableObject {
       if (path === "/sync") return this.sync(p.row, Number(url.searchParams.get("since")) || 0, show);
       if (path === "/send" && method === "POST") return this.send(p.row, await readJson(req), show);
       if (path === "/me" && method === "POST") return this.updateMe(p.row, await readJson(req));
+      if (path === "/gallery" && method === "POST") return this.saveGallery(p.row, await readJson(req));
 
       if (p.row.role !== "director") return err("Only the show director can do that.", 403);
       if (path === "/show" && method === "POST") return this.updateShow(show, await readJson(req));
@@ -396,6 +436,7 @@ export class ShowRoom extends DurableObject {
       messages: rows.map((r) => this.rowToMsg(r)),
       lastSeq,
       truncated: since > 0 && rows.length >= 600,
+      gallery: this.gallery(me.id),
       ann: { artists: artists.length, delivered },
     });
   }
@@ -450,7 +491,7 @@ export class ShowRoom extends DurableObject {
   artistInfo(id, show) {
     const a = this.member(id);
     if (!a) return err("This artist isn't in the show chat any more.", 404);
-    return json({ artist: this.publicMember(a), show: this.showInfo(show) });
+    return json({ artist: this.publicMember(a), show: this.showInfo(show), gallery: this.gallery(a.id) });
   }
 
   async buyerStart(body, show) {
@@ -480,7 +521,7 @@ export class ShowRoom extends DurableObject {
       id, await sha256(token), clean(body.name, LIMITS.name), clean(body.phone, LIMITS.phone), clean(body.email, LIMITS.email),
       artist.id, now, now, token
     );
-    const { msg } = this.insertMessage({ id: body.id, channel: "buy:" + id, sender: id, kind: "text", body: text, meta: body.piece ? { piece: clean(body.piece, 80) } : null });
+    const { msg } = this.insertMessage({ id: body.id, channel: "buy:" + id, sender: id, kind: "text", body: text, meta: this.pieceMeta(artist.id, body) });
     this.notify(msg, show);
     return json({ token, buyer: this.publicBuyer(this.buyer(id)), message: msg });
   }
@@ -493,6 +534,7 @@ export class ShowRoom extends DurableObject {
     return json({
       buyer: this.publicBuyer(b),
       artist: artist ? this.publicMember(artist) : null,
+      gallery: artist ? this.gallery(artist.id) : null,
       show: this.showInfo(show),
       messages: rows.map((r) => this.rowToMsg(r)),
       lastSeq: this.maxSeq(),
@@ -504,8 +546,10 @@ export class ShowRoom extends DurableObject {
     const b = this.buyer(p.id);
     if (!this.member(b.artist_id)) return err("This artist isn't in the show chat any more.", 404);
     const text = clean(body.body, LIMITS.body);
-    const meta = this.photoMeta(body);
-    if (!text && !meta) return err("Write a message first.");
+    const photo = this.photoMeta(body);
+    if (!text && !photo) return err("Write a message first.");
+    const pm = this.pieceMeta(b.artist_id, body);
+    const meta = photo || pm ? { ...(photo || {}), ...(pm || {}) } : null;
     const before = this.maxSeq();
     const { msg } = this.insertMessage({ id: body.id, channel: "buy:" + b.id, sender: b.id, kind: "text", body: text, meta });
     if (msg.seq > before) this.notify(msg, show);
@@ -620,7 +664,7 @@ export class ShowRoom extends DurableObject {
         return {
           who: r.sender === artist.id ? artist.name : b.name || "You",
           text: (meta && meta.piece ? `About ${meta.piece}: ` : "") + (r.body || ""),
-          img: meta && meta.img ? `${this.origin}/api/show/${this.code}/img/${meta.img}` : "",
+          img: meta && (meta.img || meta.pimg) ? `${this.origin}/api/show/${this.code}/img/${meta.img || meta.pimg}` : "",
         };
       });
   }

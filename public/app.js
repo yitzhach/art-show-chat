@@ -197,6 +197,27 @@ function pickPhoto() {
     input.click();
   });
 }
+// One pick gives a full-size copy and a small one, so booth and piece thumbnails load fast on fair wifi.
+function pickPhotoPair() {
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file"; input.accept = "image/*";
+    input.onchange = async () => {
+      const f = input.files && input.files[0];
+      if (!f) return resolve(null);
+      try { resolve({ full: await blobToDataUrl(await compressImage(f)), thumb: await blobToDataUrl(await compressImage(f, 520, 0.78)) }); }
+      catch { toast("Couldn't read that photo."); resolve(null); }
+    };
+    input.click();
+  });
+}
+// The piece a buyer asked about, shown on their message with its photo.
+function pieceCard(code, m) {
+  return m.meta && m.meta.piece && m.meta.pimg ? `<span class="pref"><img src="${esc(imgUrl(code, m.meta.pimg))}" alt="" loading="lazy"><span>About <b>${esc(m.meta.piece)}</b></span></span>` : "";
+}
+function pieceInline(m) {
+  return m.meta && m.meta.piece && !m.meta.pimg ? `<b>About ${esc(m.meta.piece)}:</b> ` : "";
+}
 function photoHtml(src) {
   return `<button type="button" class="photo" data-photo="${esc(src)}" aria-label="Open photo"><img src="${esc(src)}" alt="Photo" loading="lazy"></button>`;
 }
@@ -376,6 +397,7 @@ function ChatApp(code, sess) {
     followup: null,
     refer: { to: null, status: "Walking over now", q: "" },
     annUrgent: true,
+    gallery: cached.gallery || { booth: [], pieces: [] }, galDirty: false, galState: "",
     alerts: pushSupported() && Notification.permission === "granted" ? "on" : "off",
   };
   const token = sess.token;
@@ -391,7 +413,7 @@ function ChatApp(code, sess) {
   const buyerLink = (b) => `${origin}/b/${code}/${S.me.id}${b.key ? "?k=" + b.key : ""}`;
 
   function save() {
-    store.set(CK, { me: S.me, show: S.show, members: S.members, buyers: S.buyers, messages: S.messages.slice(-1500), lastSeq: S.lastSeq, ann: S.ann });
+    store.set(CK, { me: S.me, show: S.show, members: S.members, buyers: S.buyers, messages: S.messages.slice(-1500), lastSeq: S.lastSeq, ann: S.ann, gallery: S.gallery });
   }
   const saveOutbox = () => store.set(OK, S.outbox);
   const saveRead = () => store.set(RK, S.read);
@@ -433,6 +455,7 @@ function ChatApp(code, sess) {
     const d = r.data;
     if (d.truncated) S.messages = [];
     S.me = d.me; S.show = d.show; S.members = d.members; S.buyers = d.buyers; S.ann = d.ann;
+    if (d.gallery && !S.galDirty) S.gallery = d.gallery;
     merge(d.messages);
     S.lastSeq = Math.max(S.lastSeq, d.lastSeq);
     saveSession(code, { ...sess, id: d.me.id, name: d.me.name, role: d.me.role, showName: d.show.name });
@@ -597,7 +620,7 @@ function ChatApp(code, sess) {
     return `<div class="msg ${mine ? "me" : ""} ${cont ? "cont" : ""}">
       ${showFrom ? (cont ? `<span class="av sm" style="visibility:hidden"></span>` : avatar(sender || { id: m.from, name }, "sm")) : ""}
       <div class="body">${showFrom ? `<p class="from"><b>${esc(name)}</b>${boothTag(sender)}<span class="time">${fmtTime(m.ts)}</span></p>` : ""}
-      ${m.meta && m.meta.img ? photoHtml(imgUrl(code, m.meta.img)) : ""}${m.body ? `<div class="bubble">${m.meta && m.meta.piece ? `<b>About ${esc(m.meta.piece)}:</b> ` : ""}${linkify(m.body)}</div>` : ""}
+      ${pieceCard(code, m)}${m.meta && m.meta.img ? photoHtml(imgUrl(code, m.meta.img)) : ""}${m.body ? `<div class="bubble">${pieceInline(m)}${linkify(m.body)}</div>` : ""}
       ${!showFrom ? `<span class="state">${fmtTime(m.ts)}</span>` : ""}</div></div>`;
   }
   function pendingHtml(o) {
@@ -684,8 +707,10 @@ function ChatApp(code, sess) {
       const last = [...S.messages].reverse().find((x) => x.ch === ch);
       return { b, last, n: unread(ch) };
     }).sort((a, b) => (b.last ? b.last.seq : 0) - (a.last ? a.last.seq : 0));
+    const g = S.gallery, ng = g.booth.length + g.pieces.length;
+    const galRow = `<button class="galrow" data-go="booth"><span class="grow"><b>Booth and pieces</b><span class="small">${ng ? esc(galSummary().replace("On your QR page now: ", "On your QR page: ")) : "Add photos so buyers can tap a piece to ask about it"}</span></span><span aria-hidden="true">›</span></button>`;
     return `<section class="screen">${topBar()}${tabsHtml("buyers")}${banners()}
-      <div class="scroll">${rows.length ? rows.map(({ b, last, n }) => `<button class="convo ${n ? "unread" : ""}" data-go="buy:${b.id}">${avatar({ id: b.id, name: b.name || "Visitor" })}<span class="who"><span class="top"><span class="nm">${esc(b.name || "Visitor")}</span>${b.phone ? `<span class="pill">Text</span>` : b.email ? `<span class="pill">Email</span>` : ""}${last ? `<span class="time">${fmtShort(last.ts)}</span>` : ""}</span><span class="pv">${last ? esc((last.from === S.me.id ? "You: " : "") + last.body) : ""}</span></span>${n ? `<span class="badge">${n}</span>` : ""}</button>`).join("")
+      <div class="scroll">${galRow}${rows.length ? rows.map(({ b, last, n }) => `<button class="convo ${n ? "unread" : ""}" data-go="buy:${b.id}">${avatar({ id: b.id, name: b.name || "Visitor" })}<span class="who"><span class="top"><span class="nm">${esc(b.name || "Visitor")}</span>${b.phone ? `<span class="pill">Text</span>` : b.email ? `<span class="pill">Email</span>` : ""}${last ? `<span class="time">${fmtShort(last.ts)}</span>` : ""}</span><span class="pv">${last ? esc((last.from === S.me.id ? "You: " : "") + last.body) : ""}</span></span>${n ? `<span class="badge">${n}</span>` : ""}</button>`).join("")
         : `<div class="empty"><p>When a buyer scans your QR card and sends a message, it shows up here.</p><a class="btn small" href="/s/${esc(code)}/cards?only=me">${ICON.qr} Your QR card</a></div>`}</div></section>`;
   }
   function vBuyer(bid) {
@@ -775,6 +800,7 @@ function ChatApp(code, sess) {
             : ios ? `<p class="hint"><b>On iPhone, add Show Chat to your Home Screen first.</b></p><ol class="hint" style="margin:0;padding-left:18px"><li>Tap the Share button at the bottom of Safari.</li><li>Choose <b>Add to Home Screen</b>, then Add.</li><li>Open Show Chat from the new icon and tap Turn on alerts.</li></ol><p class="small">You stay signed in on the Home Screen app.</p>`
             : `<p class="hint">Get a buzz when a buyer messages you or another artist sends you a buyer.</p><button class="btn" data-act="alerts-on">Turn on alerts</button><p class="small" id="alert-help"></p>`}
         </div>
+        ${me.role === "artist" || !dir ? `<div class="card"><h3>Booth and pieces</h3><p class="hint">${esc(galSummary())}</p><div class="btnrow"><button class="btn small" data-go="booth">${S.gallery.booth.length || S.gallery.pieces.length ? "Edit booth photos" : "Add booth photos"}</button></div></div>` : ""}
         ${me.role === "artist" || !dir ? `<div class="card"><h3>Your QR card</h3><p class="hint">Buyers scan it to message you. No app or account for them.</p><div class="btnrow"><a class="btn small" href="/s/${esc(code)}/cards?only=me">${ICON.qr} Show or print it</a><button class="btn small ghost" data-act="copy" data-text="${esc(buyerPage(me.id))}">Copy your buyer link</button></div></div>` : ""}
         ${dir ? `<div class="card tint"><h3>Invite artists</h3><p class="hint">Artists open the link, or type the code on the home page.</p>
           <div class="copyline"><code>${esc(code)}</code><button class="btn small" data-act="share-invite">Share invite</button></div>
@@ -788,6 +814,86 @@ function ChatApp(code, sess) {
         <p class="small" style="text-align:center">Show Chat beta ${VERSION} · show code ${esc(code)}</p>
       </div></div></section>`;
   }
+  function galSummary() {
+    const g = S.gallery, nb = g.booth.length, np = g.pieces.length;
+    if (!nb && !np) return "Add booth shots and a photo of each piece once you're set up. Buyers see them when they scan your card and can tap a piece to ask about it.";
+    return `On your QR page now: ${nb} booth photo${nb === 1 ? "" : "s"} and ${np} piece${np === 1 ? "" : "s"}.`;
+  }
+  function galStateText() {
+    return { uploading: "Adding the photo…", pending: "Saving…", saving: "Saving…", saved: "Saved. Buyers see this now.", error: "Not saved yet. It saves by itself when you have signal." }[S.galState] || "";
+  }
+  function vBooth() {
+    const g = S.gallery;
+    const tile = (x, act, i) => `<div class="galtile"><button type="button" class="galimg" data-photo="${esc(imgUrl(code, x.img))}" aria-label="Open photo"><img src="${esc(imgUrl(code, x.thumb || x.img))}" alt="" loading="lazy"></button><button type="button" class="galx" data-act="${act}" data-i="${i}" aria-label="Remove this photo">✕</button></div>`;
+    return `<section class="screen">${subBar("Booth and pieces", "What buyers see when they scan your card")}
+      <div class="scroll"><div class="pad">
+        <p class="hint">Take these once your booth is set up. They show at the top of your QR page, and a buyer can tap a piece to ask you about it.</p>
+        <div class="card"><h3>Booth shots</h3><p class="small">Up to 8. Put a wide one of the whole booth first.</p>
+          <div class="galgrid">${g.booth.map((x, i) => tile(x, "gal-del-shot", i)).join("")}${g.booth.length < 8 ? `<button type="button" class="galadd" data-act="gal-add-shot">+ Add a booth photo</button>` : ""}</div></div>
+        <div class="card"><h3>Pieces</h3><p class="small">One photo per piece. A title and price help, and you can mark a piece sold.</p>
+          ${g.pieces.map((pc, i) => `<div class="pieceedit">
+            <button type="button" class="pthumb" data-photo="${esc(imgUrl(code, pc.img))}" aria-label="Open photo"><img src="${esc(imgUrl(code, pc.thumb || pc.img))}" alt="" loading="lazy"></button>
+            <div class="pfields">
+              <input class="input" data-pf="title" data-i="${i}" value="${esc(pc.title)}" maxlength="60" placeholder="Title" aria-label="Title">
+              <div class="row2"><input class="input" data-pf="price" data-i="${i}" value="${esc(pc.price)}" maxlength="30" placeholder="Price" aria-label="Price"><input class="input" data-pf="note" data-i="${i}" value="${esc(pc.note)}" maxlength="120" placeholder="Size or note" aria-label="Size or note"></div>
+              <div class="prow"><label class="check"><input type="checkbox" data-pf="sold" data-i="${i}" ${pc.sold ? "checked" : ""}> Sold</label><button type="button" class="linkbtn" data-act="gal-del-piece" data-i="${i}">Remove</button></div>
+            </div></div>`).join("")}
+          ${g.pieces.length < 40 ? `<button type="button" class="btn ghost" data-act="gal-add-piece">${PHOTO_ICON} Add a piece</button>` : ""}
+        </div>
+        <p class="small" id="gal-state" aria-live="polite">${galStateText()}</p>
+        <div class="btnrow"><a class="btn small ghost" href="/b/${esc(code)}/${esc(S.me.id)}" target="_blank" rel="noopener">Preview your buyer page</a></div>
+      </div></div></section>`;
+  }
+  const setGalState = (st) => { S.galState = st; const el = $("#gal-state"); if (el) el.textContent = galStateText(); };
+  let galTimer = null, galRev = 0, galTries = 0;
+  function galQueue() { S.galDirty = true; galRev++; setGalState("pending"); clearTimeout(galTimer); galTimer = setTimeout(galSave, 700); }
+  async function galSave() {
+    clearTimeout(galTimer);
+    S.galDirty = true;
+    const rev = galRev;
+    setGalState("saving");
+    const r = await api(`/show/${code}/gallery`, { method: "POST", token, body: S.gallery });
+    if (r.ok) {
+      galTries = 0;
+      // Keep anything typed while the save was on its way; the next save sends it.
+      if (rev === galRev) { S.gallery = r.data.gallery; S.galDirty = false; setGalState("saved"); }
+      save();
+      return;
+    }
+    if (r.status === 401) return signedOut();
+    if (r.status === 0 || r.status >= 500 || r.status === 429) { setGalState("error"); galTimer = setTimeout(galSave, retryDelay(galTries++)); return; }
+    setGalState(""); toast(r.data.error || "Couldn't save your booth photos.");
+  }
+  async function galAdd(kind) {
+    const ph = await pickPhotoPair();
+    if (!ph) return;
+    setGalState("uploading");
+    const [a, b] = await Promise.all([uploadPhoto(code, token, ph.full), uploadPhoto(code, token, ph.thumb)]);
+    if (!a.ok || !b.ok) {
+      setGalState("");
+      toast(a.status === 0 || b.status === 0 ? "No signal right now. Add the photo again when you're connected." : (a.data.error || b.data.error || "That photo couldn't be added."));
+      return;
+    }
+    const item = { img: a.data.id, thumb: b.data.id };
+    if (kind === "shot") S.gallery.booth.push(item);
+    else S.gallery.pieces.push({ id: "p" + uid().replace(/[^a-z0-9]/gi, "").toLowerCase().slice(0, 10), ...item, title: "", price: "", note: "", sold: false });
+    galRev++;
+    render();
+    if (kind === "piece") { const el = $$('[data-pf="title"]').pop(); if (el) el.focus(); }
+    await galSave();
+  }
+  app.addEventListener("input", (e) => {
+    const f = e.target.dataset && e.target.dataset.pf;
+    if (!f || f === "sold") return;
+    const pc = S.gallery.pieces[Number(e.target.dataset.i)];
+    if (pc) { pc[f] = e.target.value; galQueue(); }
+  });
+  app.addEventListener("change", (e) => {
+    if (!(e.target.dataset && e.target.dataset.pf === "sold")) return;
+    const pc = S.gallery.pieces[Number(e.target.dataset.i)];
+    if (pc) { pc.sold = e.target.checked; galQueue(); }
+  });
+
   function vWelcome() {
     const dir = isDirector();
     return `<section class="screen">${subBar(dir ? "Your show is ready" : "You're in", esc(S.show.name))}
@@ -795,7 +901,8 @@ function ChatApp(code, sess) {
         <div class="showcard"><span class="name">${esc(S.show.name)}</span><span class="meta">Show code ${esc(code)}</span></div>
         ${dir ? `<p>Send artists the invite. They join with their name and booth, no password.</p><button class="btn" data-act="share-invite">Share invite link</button>
           <p class="hint">Keep your own sign-in link somewhere safe, in case you switch phones.</p><button class="btn ghost" data-act="copy" data-text="${esc(myLink())}">Copy my director link</button>`
-          : `<p>Your QR card lets buyers message you straight from your booth.</p><a class="btn" href="/s/${esc(code)}/cards?only=me">${ICON.qr} See your QR card</a>`}
+          : `<p>Your QR card lets buyers message you straight from your booth.</p><a class="btn" href="/s/${esc(code)}/cards?only=me">${ICON.qr} See your QR card</a>
+            <button class="btn ghost" data-go="booth">Add booth and piece photos</button>`}
         ${pushSupported() ? `<button class="btn ghost" data-act="alerts-on">Turn on alerts</button>` : isIOS() ? `<button class="btn ghost" data-go="me">Get alerts on iPhone</button>` : ""}
         <button class="btn ghost" data-go="group">Go to the show chat</button>
       </div></div></section>`;
@@ -805,7 +912,7 @@ function ChatApp(code, sess) {
   let lastHtml = "";
   function render(opts = {}) {
     const v = view();
-    if (opts.soft && ["refer", "me", "people", "welcome"].includes(v)) { updateBadges(); return; }
+    if (opts.soft && ["refer", "me", "people", "welcome", "booth"].includes(v)) { updateBadges(); return; }
     const prevScroller = $("#scroller");
     const wasAtBottom = !prevScroller || prevScroller.scrollHeight - prevScroller.scrollTop - prevScroller.clientHeight < 80;
     const prevTop = prevScroller ? prevScroller.scrollTop : 0;
@@ -820,6 +927,7 @@ function ChatApp(code, sess) {
     else if (v === "people") html = vPeople();
     else if (v === "me") html = vMe();
     else if (v === "welcome") html = vWelcome();
+    else if (v === "booth") html = vBooth();
     else if (v.startsWith("dm:")) html = vDM(v.slice(3));
     else if (v.startsWith("buy:")) html = vBuyer(v.slice(4));
     else html = vGroup();
@@ -859,7 +967,7 @@ function ChatApp(code, sess) {
     if (t.dataset.status) { S.refer.status = t.dataset.status; return render(); }
     if (t.dataset.urgent) { S.annUrgent = t.dataset.urgent === "1"; return render(); }
     const act = t.dataset.act;
-    if (act === "back") { e.preventDefault(); if (history.length > 1 && document.referrer !== "") history.back(); else go(view().startsWith("buy:") ? "buyers" : view().startsWith("dm:") ? "direct" : "group"); setTimeout(() => { if (["refer", "people", "me", "welcome"].includes(view()) || view() === "") render(); }, 50); return; }
+    if (act === "back") { e.preventDefault(); if (history.length > 1 && document.referrer !== "") history.back(); else go(view().startsWith("buy:") ? "buyers" : view().startsWith("dm:") ? "direct" : "group"); setTimeout(() => { if (["refer", "people", "me", "welcome", "booth"].includes(view()) || view() === "") render(); }, 50); return; }
     if (act === "unpin") { S.read.pin = Number(t.dataset.seq); saveRead(); return render(); }
     if (act === "alerts-dismiss") { S.read.alertsDismissed = true; saveRead(); return render(); }
     if (act === "alerts-banner") { if (isIOS() && !isStandalone()) return go("me"); return turnOnAlerts(); }
@@ -870,6 +978,14 @@ function ChatApp(code, sess) {
       return;
     }
     if (act === "copy") return copyText(t.dataset.text);
+    if (act === "gal-add-shot") return galAdd("shot");
+    if (act === "gal-add-piece") return galAdd("piece");
+    if (act === "gal-del-shot") { S.gallery.booth.splice(Number(t.dataset.i), 1); galRev++; render(); return galSave(); }
+    if (act === "gal-del-piece") {
+      const pc = S.gallery.pieces[Number(t.dataset.i)];
+      if (!pc || !confirm(`Remove ${pc.title || "this piece"} from your QR page?`)) return;
+      S.gallery.pieces.splice(Number(t.dataset.i), 1); galRev++; render(); return galSave();
+    }
     if (act === "photo") {
       const form = t.closest("form"); const ch = form && form.dataset.compose;
       const photo = await pickPhoto(); if (!photo || !ch) return;
@@ -980,7 +1096,7 @@ async function Buyer(code, artistId) {
   if (k) saveBuyer(key, { token: k });
   const CK = "asc.bcache." + key;
   const cached = store.get(CK, {});
-  const B = { artist: cached.artist || null, show: cached.show || null, buyer: cached.buyer || null, messages: cached.messages || [], outbox: store.get("asc.boutbox." + key, []), online: true, alerts: pushSupported() && Notification.permission === "granted" ? "on" : "off" };
+  const B = { artist: cached.artist || null, show: cached.show || null, buyer: cached.buyer || null, gallery: cached.gallery || null, piece: null, messages: cached.messages || [], outbox: store.get("asc.boutbox." + key, []), online: true, alerts: pushSupported() && Notification.permission === "granted" ? "on" : "off" };
   let ws = null, backoff = 1000, openedAt = 0, flushing = false, lastHtml = "", sendTries = 0, retryTimer = null, lastPong = Date.now();
 
   let info = await api(`/show/${code}/artist?id=${artistId}`, { timeout: 10000 });
@@ -992,7 +1108,7 @@ async function Buyer(code, artistId) {
       info = await api(`/show/${code}/artist?id=${artistId}`, { timeout: 10000 });
     }
   }
-  if (info.ok) { B.artist = info.data.artist; B.show = info.data.show; }
+  if (info.ok) { B.artist = info.data.artist; B.show = info.data.show; if (info.data.gallery) B.gallery = info.data.gallery; }
   else if (!B.artist) {
     app.innerHTML = `<section class="screen"><div class="empty"><h3>${info.status === 404 ? "This card isn't active" : "Can't load this page"}</h3><p>${info.status === 404 ? "The artist may have left the show chat." : "Check your signal and try again."}</p><button class="btn small" onclick="location.reload()">Try again</button></div></section>`;
     return;
@@ -1000,7 +1116,7 @@ async function Buyer(code, artistId) {
   const A = () => B.artist;
   const first = () => (A().name || "the artist").split(/\s+/)[0];
   const sess = () => buyerSessions()[key];
-  const saveCache = () => store.set(CK, { artist: B.artist, show: B.show, buyer: B.buyer, messages: B.messages.slice(-500) });
+  const saveCache = () => store.set(CK, { artist: B.artist, show: B.show, buyer: B.buyer, gallery: B.gallery, messages: B.messages.slice(-500) });
   const saveOutbox = () => store.set("asc.boutbox." + key, B.outbox);
   document.title = `Message ${A().name}`;
 
@@ -1020,7 +1136,7 @@ async function Buyer(code, artistId) {
     const r = await api(`/show/${code}/buyer/sync?since=0`, { token: s.token });
     if (r.status === 401) { const all = buyerSessions(); delete all[key]; store.set("asc.buyers", all); render(); return; }
     if (!r.ok) { B.online = r.status !== 0; return render(); }
-    B.online = true; B.buyer = r.data.buyer; if (r.data.artist) B.artist = r.data.artist;
+    B.online = true; B.buyer = r.data.buyer; if (r.data.artist) B.artist = r.data.artist; if (r.data.gallery) B.gallery = r.data.gallery;
     merge(r.data.messages); saveCache(); render();
   }
   async function flush() {
@@ -1056,7 +1172,7 @@ async function Buyer(code, artistId) {
     const s = sess(); if (!s || (ws && ws.readyState <= 1)) return;
     ws = new WebSocket(`${WS_BASE}/api/show/${code}/ws?t=${encodeURIComponent(s.token)}`);
     ws.onopen = () => { openedAt = Date.now(); lastPong = Date.now(); sync(); flush(); ws.send(JSON.stringify({ t: "vis", v: document.visibilityState === "visible" })); };
-    ws.onmessage = (e) => { lastPong = Date.now(); if (e.data === "pong") return; try { const d = JSON.parse(e.data); if (d.t === "msg" && merge([d.m])) render(); } catch {} };
+    ws.onmessage = (e) => { lastPong = Date.now(); if (e.data === "pong") return; try { const d = JSON.parse(e.data); if (d.t === "msg" && merge([d.m])) render(); else if (d.t === "gallery") { B.gallery = d.g; saveCache(); render(); } } catch {} };
     ws.onclose = () => { ws = null; if (openedAt && Date.now() - openedAt > 15000) backoff = 1000; openedAt = 0; setTimeout(connect, backoff); backoff = Math.min(backoff * 2, 20000); };
   }
   setInterval(() => {
@@ -1076,12 +1192,40 @@ async function Buyer(code, artistId) {
     const a = A();
     return a.instagram ? `<a class="btn igbtn" href="https://ig.me/m/${encodeURIComponent(a.instagram)}" target="_blank" rel="noopener">Message @${esc(a.instagram)} on Instagram</a>` : "";
   }
+  const pieceById = (id) => (id && B.gallery && B.gallery.pieces.find((x) => x.id === id)) || null;
+  function galleryHtml(grid) {
+    const g = B.gallery;
+    if (!g || (!g.booth.length && !g.pieces.length)) return "";
+    const shots = g.booth.length ? `<div class="bstrip">${g.booth.map((x, i) => `<button type="button" class="bshot" data-photo="${esc(imgUrl(code, x.img))}" aria-label="Open booth photo ${i + 1}"><img src="${esc(imgUrl(code, x.thumb || x.img))}" alt="${esc(A().name)}'s booth" loading="lazy"></button>`).join("")}</div>` : "";
+    const pcs = g.pieces.map((pc) => {
+      const on = B.piece === pc.id, title = pc.title || "Untitled";
+      return `<div class="pcard ${on ? "on" : ""} ${pc.sold ? "sold" : ""}"><button type="button" class="pimg" data-photo="${esc(imgUrl(code, pc.img))}" aria-label="Open photo of ${esc(title)}"><img src="${esc(imgUrl(code, pc.thumb || pc.img))}" alt="${esc(title)}" loading="lazy">${pc.sold ? `<span class="soldtag">Sold</span>` : ""}</button>
+        <span class="pt">${esc(title)}</span>${pc.price || pc.note ? `<span class="pp">${esc([pc.price, pc.note].filter(Boolean).join(" · "))}</span>` : ""}
+        <button type="button" class="btn small ${on ? "" : "ghost"}" data-piece="${esc(pc.id)}" aria-pressed="${on}">${on ? "Asking about this" : "Ask about this"}</button></div>`;
+    }).join("");
+    return `<div class="gallery">${shots ? `<p class="label">At the booth</p>${shots}` : ""}${pcs ? `<p class="label">${grid ? "Tap a piece to ask about it" : "Pieces"}</p><div class="${grid ? "pgrid" : "pstrip"}">${pcs}</div>` : ""}</div>`;
+  }
+  function pieceChip() {
+    const pc = pieceById(B.piece);
+    if (!pc) return "";
+    return `<div class="pchip"><img src="${esc(imgUrl(code, pc.thumb || pc.img))}" alt=""><span class="grow">About <b>${esc(pc.title || "this piece")}</b></span><button type="button" data-piece-clear aria-label="Don't attach this piece">✕</button></div>`;
+  }
+  function pendingPiece(o) {
+    const pc = pieceById(o.pieceId);
+    return pc ? `<span class="pref"><img src="${esc(imgUrl(code, pc.thumb || pc.img))}" alt=""><span>About <b>${esc(pc.title || "this piece")}</b></span></span>` : "";
+  }
+  function takePiece(item) {
+    const pc = pieceById(B.piece);
+    if (pc) { item.pieceId = pc.id; item.piece = pc.title || "this piece"; }
+    B.piece = null;
+    return item;
+  }
   function thread() {
     const items = B.messages.map((m) => {
       if (m.kind === "move") return `<p class="sys moved">${esc(m.body.replace(/^.*? moved/, "You moved"))}</p>`;
       const mine = m.from !== artistId;
-      return `<div class="msg ${mine ? "me" : ""}">${mine ? "" : avatar(A(), "sm")}<div class="body">${m.meta && m.meta.img ? photoHtml(imgUrl(code, m.meta.img)) : ""}${m.body ? `<div class="bubble">${m.meta && m.meta.piece ? `<b>About ${esc(m.meta.piece)}:</b> ` : ""}${linkify(m.body)}</div>` : ""}<span class="state">${mine ? "You" : esc(first())} · ${fmtDay(m.ts)} ${fmtTime(m.ts)}</span></div></div>`;
-    }).join("") + B.outbox.map((o) => `<div class="msg me pending"><div class="body">${o.photo ? photoHtml(o.photo) : ""}${o.body ? `<div class="bubble">${linkify(o.body)}</div>` : ""}<span class="state">${B.online ? "Sending…" : "Waiting for signal, it'll send by itself"}</span></div></div>`).join("");
+      return `<div class="msg ${mine ? "me" : ""}">${mine ? "" : avatar(A(), "sm")}<div class="body">${pieceCard(code, m)}${m.meta && m.meta.img ? photoHtml(imgUrl(code, m.meta.img)) : ""}${m.body ? `<div class="bubble">${pieceInline(m)}${linkify(m.body)}</div>` : ""}<span class="state">${mine ? "You" : esc(first())} · ${fmtDay(m.ts)} ${fmtTime(m.ts)}</span></div></div>`;
+    }).join("") + B.outbox.map((o) => `<div class="msg me pending"><div class="body">${pendingPiece(o)}${o.photo ? photoHtml(o.photo) : ""}${o.body ? `<div class="bubble">${linkify(o.body)}</div>` : ""}<span class="state">${B.online ? "Sending…" : "Waiting for signal, it'll send by itself"}</span></div></div>`).join("");
     return `<div class="msgs" style="padding:0">${items}</div>`;
   }
 
@@ -1129,7 +1273,8 @@ async function Buyer(code, artistId) {
     if (!s && !B.outbox.length) {
       html = `<section class="screen"><div class="scroll"><form class="pad" id="start">
         ${head()}
-        <div class="field"><label class="label" for="b-msg">Message ${esc(first())}</label><textarea class="textarea" id="b-msg" required maxlength="2000" placeholder="Is the blue piece still available? Do you ship?"></textarea></div>
+        ${galleryHtml(true)}
+        <div class="field"><label class="label" for="b-msg">Message ${esc(first())}</label>${pieceChip()}<textarea class="textarea" id="b-msg" required maxlength="2000" placeholder="${pieceById(B.piece) ? "Is it still available? Do you ship?" : "Is the blue piece still available? Do you ship?"}"></textarea></div>
         <div class="oq"><p class="label" style="color:var(--accent)">How should ${esc(first())} reply?</p>
           <div class="field"><label class="label" for="b-phone">Your phone, for a text back</label><input class="input" id="b-phone" type="tel" autocomplete="tel" maxlength="30" placeholder="(305) 555-0100"></div>
           <div class="field"><label class="label" for="b-email">Or your email</label><input class="input" id="b-email" type="email" autocomplete="email" maxlength="120" placeholder="you@email.com"></div>
@@ -1146,12 +1291,14 @@ async function Buyer(code, artistId) {
         <div class="appbar"><div class="grow"><h2>${esc(A().name)}</h2><div class="sub">${esc([A().booth ? "Booth " + A().booth : "", B.show && B.show.name].filter(Boolean).join(" · "))}</div></div>${A().instagram ? `<a class="iconbtn" href="https://ig.me/m/${encodeURIComponent(A().instagram)}" target="_blank" rel="noopener" aria-label="Message on Instagram"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r="1" fill="currentColor"/></svg></a>` : ""}</div>
         ${!B.online ? `<div class="banner warn" style="margin-top:8px"><span class="grow">No signal. Your message will send when you're back.</span></div>` : ""}
         <div class="scroll" id="scroller"><div class="pad">
+          ${galleryHtml(false)}
           ${thread()}
           ${needContact && s ? `<form class="oq" id="contact"><p class="label" style="color:var(--accent)">Get ${esc(first())}'s reply by text</p><input class="input" id="c-phone" type="tel" autocomplete="tel" placeholder="Your phone" maxlength="30"><input class="input" id="c-email" type="email" autocomplete="email" placeholder="Or your email" maxlength="120"><button class="btn small">Save</button></form>` : ""}
           ${s && B.alerts !== "on" && pushSupported() ? `<button class="btn ghost small" id="b-alerts">Get a notification here when ${esc(first())} replies</button>` : ""}
           ${s ? carryOn() : ""}
           ${s ? `<button class="btn ghost small" id="b-save">Save this conversation (copy your private link)</button>` : ""}
         </div></div>
+        ${B.piece ? `<div class="chipwrap">${pieceChip()}</div>` : ""}
         <form class="composer" id="b-compose"><button class="photobtn" type="button" id="b-photo" aria-label="Send a photo">${PHOTO_ICON}</button><textarea class="input" rows="1" id="b-input" placeholder="Message ${esc(first())}" aria-label="Message"></textarea><button class="send" aria-label="Send">${ICON.send}</button></form>
       </section>`;
     }
@@ -1167,12 +1314,12 @@ async function Buyer(code, artistId) {
     e.preventDefault();
     if (e.target.id === "start") {
       const body = $("#b-msg").value.trim(); if (!body) return;
-      B.outbox.push({ id: uid(), body, name: $("#b-name").value, phone: $("#b-phone").value, email: $("#b-email").value });
+      B.outbox.push(takePiece({ id: uid(), body, name: $("#b-name").value, phone: $("#b-phone").value, email: $("#b-email").value }));
       B.buyer = { name: $("#b-name").value, phone: $("#b-phone").value, email: $("#b-email").value };
       saveOutbox(); lastHtml = ""; render(); flush();
     } else if (e.target.id === "b-compose") {
       const el = $("#b-input"); const body = el.value.trim(); if (!body) return;
-      el.value = ""; B.outbox.push({ id: uid(), body }); saveOutbox(); render(); flush();
+      el.value = ""; B.outbox.push(takePiece({ id: uid(), body })); saveOutbox(); render(); flush();
     } else if (e.target.id === "contact") {
       const r = await api(`/show/${code}/buyer/me`, { method: "POST", token: sess().token, body: { phone: $("#c-phone").value, email: $("#c-email").value } });
       if (r.ok) { B.buyer = r.data.buyer; saveCache(); toast(`Saved. ${first()} can text or email you now.`); render(); } else toast(r.data.error || "Couldn't save. Check your signal.");
@@ -1181,9 +1328,18 @@ async function Buyer(code, artistId) {
   app.addEventListener("click", async (e) => {
     const mv = e.target.closest("[data-move]");
     if (mv) return moveTo(mv.dataset.move);
+    const pk = e.target.closest("[data-piece]");
+    if (pk) {
+      B.piece = B.piece === pk.dataset.piece ? null : pk.dataset.piece;
+      render();
+      const box = $("#b-msg") || $("#b-input");
+      if (box && B.piece) { box.focus(); box.scrollIntoView({ block: "center", behavior: "smooth" }); }
+      return;
+    }
+    if (e.target.closest("[data-piece-clear]")) { B.piece = null; render(); return; }
     if (e.target.closest("#b-photo")) {
       const photo = await pickPhoto(); if (!photo) return;
-      B.outbox.push({ id: uid(), body: "", photo }); saveOutbox(); render(); flush(); return;
+      B.outbox.push(takePiece({ id: uid(), body: "", photo })); saveOutbox(); render(); flush(); return;
     }
     if (e.target.id === "b-alerts") {
       const r = await ensurePush(code, sess().token, { ask: true });
