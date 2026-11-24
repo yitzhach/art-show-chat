@@ -341,7 +341,8 @@ export class ShowRoom extends DurableObject {
     } else if (type === "booth") {
       booth = a ? normBooth(a.booth) : normBooth(body.booth);
       if (!booth) return err("Type a booth number.");
-      artist = a ? a.id : "";
+      const owner = a || this.artistsByBooth().get(booth);
+      artist = owner ? owner.id : "";
       k = "b:" + booth;
     } else {
       const sid = String(body.sid || "");
@@ -349,7 +350,8 @@ export class ShowRoom extends DurableObject {
       k = "s:" + sid;
       if (on) {
         booth = a ? normBooth(a.booth) : normBooth(body.booth);
-        artist = a ? a.id : "";
+        const owner = a || this.artistsByBooth().get(booth);
+        artist = owner ? owner.id : "";
         img = String(body.img || "");
         const mine = /^[A-Za-z0-9]{16,40}$/.test(img) && this.sql.exec("SELECT COUNT(*) AS n FROM images WHERE id = ? AND owner = ?", img, v.id).one().n > 0;
         if (!mine) return err("That photo couldn't be saved.");

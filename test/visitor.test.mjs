@@ -93,6 +93,9 @@ me = (await j(`/show/${show}/visitor/me`, { t: v1.token })).data;
 ok(me.favs.find((f) => f.k === "b:F7").artist.name === "Fay Ortiz", "visitors' saved booth now links to the artist who claimed it");
 const fins = (await j(`/show/${show}/insights`, { t: fay.token })).data;
 ok(fins.savers === 2 && fins.early === 2 && fins.visits === 1, "the claiming artist sees the visitors who saved their booth before they joined");
+await j(`/show/${show}/visitor/fav`, { method: "POST", t: v3.token, body: { type: "booth", booth: "f7" } });
+const fins2 = (await j(`/show/${show}/insights`, { t: fay.token })).data;
+ok(fins2.savers === 3 && fins2.early === 2, "a booth number typed after the artist joined counts as a save, not an early one");
 
 // Artist numbers
 await j(`/show/${show}/buyer/start`, { method: "POST", body: { id: "q1" + code, artist: maya.me.id, body: "Still available?", pieceId: "pvase00001" } });
