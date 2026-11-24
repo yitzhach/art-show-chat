@@ -66,7 +66,7 @@ a { color: var(--accent); }
 .btnrow { display: flex; flex-wrap: wrap; gap: 8px; }
 .or { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; }
 .or::before, .or::after { content: ""; height: 1px; background: var(--line); flex: 1; }
-.hint, .small { font-size: 13px; color: var(--muted); margin: 0; }
+.hint, p.small, span.small { font-size: 13px; color: var(--muted); margin: 0; }
 .error { color: var(--danger); font-size: 14px; margin: 0; }
 h1.display { font-family: var(--font-display); font-weight: 700; font-size: 32px; line-height: 1.05; margin: 0; }
 h3 { font-family: var(--font-display); font-size: 20px; margin: 0; }

@@ -372,7 +372,7 @@ function ChatApp(code, sess) {
     alerts: pushSupported() && Notification.permission === "granted" ? "on" : "off",
   };
   const token = sess.token;
-  let ws = null, backoff = 1000, lastPong = Date.now(), syncing = false, flushing = false, retryTimer = null;
+  let ws = null, backoff = 1000, openedAt = 0, lastPong = Date.now(), syncing = false, flushing = false, retryTimer = null;
   const origin = SITE;
   const isDirector = () => S.me.role === "director";
   const member = (id) => S.members.find((m) => m.id === id);
@@ -472,7 +472,7 @@ function ChatApp(code, sess) {
     if (ws && ws.readyState <= 1) return;
     try { ws = new WebSocket(`${WS_BASE}/api/show/${code}/ws?t=${encodeURIComponent(token)}`); }
     catch { ws = null; return; }
-    ws.onopen = () => { backoff = 1000; lastPong = Date.now(); sendVis(); S.online = true; sync(); flush(); };
+    ws.onopen = () => { openedAt = Date.now(); lastPong = Date.now(); sendVis(); S.online = true; sync(); flush(); };
     ws.onmessage = (e) => {
       lastPong = Date.now();
       if (e.data === "pong") return;
@@ -483,6 +483,9 @@ function ChatApp(code, sess) {
     ws.onclose = (e) => {
       ws = null;
       if (e.code === 4001) return signedOut();
+      // Only treat the link as healthy if it stayed up a while, so a flaky network doesn't reconnect in a tight loop.
+      if (openedAt && Date.now() - openedAt > 15000) backoff = 1000;
+      openedAt = 0;
       setTimeout(connect, backoff);
       backoff = Math.min(backoff * 2, 20000);
     };
@@ -791,6 +794,7 @@ function ChatApp(code, sess) {
   }
 
   // ----- render (keeps typing, focus and scroll position across updates) -----
+  let lastHtml = "";
   function render(opts = {}) {
     const v = view();
     if (opts.soft && ["refer", "me", "people", "welcome"].includes(v)) { updateBadges(); return; }
@@ -811,6 +815,8 @@ function ChatApp(code, sess) {
     else if (v.startsWith("dm:")) html = vDM(v.slice(3));
     else if (v.startsWith("buy:")) html = vBuyer(v.slice(4));
     else html = vGroup();
+    if (sameView && html === lastHtml) { updateBadges(); return; }
+    lastHtml = html;
     app.innerHTML = html;
     app.dataset.view = v;
     for (const el of $$("[data-draft]")) {
@@ -967,7 +973,7 @@ async function Buyer(code, artistId) {
   const CK = "asc.bcache." + key;
   const cached = store.get(CK, {});
   const B = { artist: cached.artist || null, show: cached.show || null, buyer: cached.buyer || null, messages: cached.messages || [], outbox: store.get("asc.boutbox." + key, []), online: true, alerts: pushSupported() && Notification.permission === "granted" ? "on" : "off" };
-  let ws = null, backoff = 1000, flushing = false;
+  let ws = null, backoff = 1000, openedAt = 0, flushing = false, lastHtml = "";
 
   const info = await api(`/show/${code}/artist?id=${artistId}`);
   if (info.ok) { B.artist = info.data.artist; B.show = info.data.show; }
@@ -1031,9 +1037,9 @@ async function Buyer(code, artistId) {
   function connect() {
     const s = sess(); if (!s || (ws && ws.readyState <= 1)) return;
     ws = new WebSocket(`${WS_BASE}/api/show/${code}/ws?t=${encodeURIComponent(s.token)}`);
-    ws.onopen = () => { backoff = 1000; sync(); flush(); ws.send(JSON.stringify({ t: "vis", v: document.visibilityState === "visible" })); };
+    ws.onopen = () => { openedAt = Date.now(); sync(); flush(); ws.send(JSON.stringify({ t: "vis", v: document.visibilityState === "visible" })); };
     ws.onmessage = (e) => { if (e.data === "pong") return; try { const d = JSON.parse(e.data); if (d.t === "msg" && merge([d.m])) render(); } catch {} };
-    ws.onclose = () => { ws = null; setTimeout(connect, backoff); backoff = Math.min(backoff * 2, 20000); };
+    ws.onclose = () => { ws = null; if (openedAt && Date.now() - openedAt > 15000) backoff = 1000; openedAt = 0; setTimeout(connect, backoff); backoff = Math.min(backoff * 2, 20000); };
   }
   setInterval(() => { if (ws && ws.readyState === 1) ws.send("ping"); else if (sess()) sync(); }, 20000);
   document.addEventListener("visibilitychange", () => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: "vis", v: document.visibilityState === "visible" })); if (document.visibilityState === "visible") { sync(); flush(); connect(); } });
@@ -1093,8 +1099,11 @@ async function Buyer(code, artistId) {
     const s = sess();
     const active = document.activeElement ? document.activeElement.id : null;
     const keep = {}; for (const el of $$("input,textarea", app)) keep[el.id] = el.value;
+    const prev = $("#scroller");
+    const atBottom = !prev || prev.scrollHeight - prev.scrollTop - prev.clientHeight < 80;
+    let html;
     if (!s && !B.outbox.length) {
-      app.innerHTML = `<section class="screen"><div class="scroll"><form class="pad" id="start">
+      html = `<section class="screen"><div class="scroll"><form class="pad" id="start">
         ${head()}
         <div class="field"><label class="label" for="b-msg">Message ${esc(first())}</label><textarea class="textarea" id="b-msg" required maxlength="2000" placeholder="Is the blue piece still available? Do you ship?"></textarea></div>
         <div class="oq"><p class="label" style="color:var(--accent)">How should ${esc(first())} reply?</p>
@@ -1109,7 +1118,7 @@ async function Buyer(code, artistId) {
     } else {
       const b = B.buyer || {};
       const needContact = !b.phone && !b.email;
-      app.innerHTML = `<section class="screen">
+      html = `<section class="screen">
         <div class="appbar"><div class="grow"><h2>${esc(A().name)}</h2><div class="sub">${esc([A().booth ? "Booth " + A().booth : "", B.show && B.show.name].filter(Boolean).join(" · "))}</div></div>${A().instagram ? `<a class="iconbtn" href="https://ig.me/m/${encodeURIComponent(A().instagram)}" target="_blank" rel="noopener" aria-label="Message on Instagram"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r="1" fill="currentColor"/></svg></a>` : ""}</div>
         ${!B.online ? `<div class="banner warn" style="margin-top:8px"><span class="grow">No signal. Your message will send when you're back.</span></div>` : ""}
         <div class="scroll" id="scroller"><div class="pad">
@@ -1121,8 +1130,11 @@ async function Buyer(code, artistId) {
         </div></div>
         <form class="composer" id="b-compose"><button class="photobtn" type="button" id="b-photo" aria-label="Send a photo">${PHOTO_ICON}</button><textarea class="input" rows="1" id="b-input" placeholder="Message ${esc(first())}" aria-label="Message"></textarea><button class="send" aria-label="Send">${ICON.send}</button></form>
       </section>`;
-      const sc = $("#scroller"); if (sc) sc.scrollTop = sc.scrollHeight;
     }
+    if (html === lastHtml) return;
+    lastHtml = html;
+    app.innerHTML = html;
+    const sc = $("#scroller"); if (sc && atBottom) sc.scrollTop = sc.scrollHeight;
     for (const [id, v] of Object.entries(keep)) { const el = document.getElementById(id); if (el && v) el.value = v; }
     if (active) { const el = document.getElementById(active); if (el) el.focus(); }
   }
@@ -1133,7 +1145,7 @@ async function Buyer(code, artistId) {
       const body = $("#b-msg").value.trim(); if (!body) return;
       B.outbox.push({ id: uid(), body, name: $("#b-name").value, phone: $("#b-phone").value, email: $("#b-email").value });
       B.buyer = { name: $("#b-name").value, phone: $("#b-phone").value, email: $("#b-email").value };
-      saveOutbox(); app.innerHTML = ""; render(); flush();
+      saveOutbox(); lastHtml = ""; render(); flush();
     } else if (e.target.id === "b-compose") {
       const el = $("#b-input"); const body = el.value.trim(); if (!body) return;
       el.value = ""; B.outbox.push({ id: uid(), body }); saveOutbox(); render(); flush();
