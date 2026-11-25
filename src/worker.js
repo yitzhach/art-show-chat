@@ -5,7 +5,8 @@ import { generateVapidKeys, sendPush } from "./webpush.js";
 import { mailReady, ownerMailReady, renderMail, sendMail } from "./mail.js";
 
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-const LIMITS = { name: 60, booth: 12, medium: 80, body: 2000, phone: 30, email: 120, venue: 120, dates: 80 };
+const REACTIONS = ["heart", "up", "down", "haha", "bang", "q"];
+const LIMITS = { bio: 300, group: 40, name: 60, booth: 12, medium: 80, body: 2000, phone: 30, email: 120, venue: 120, dates: 80 };
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -130,12 +131,20 @@ export class ShowRoom extends DurableObject {
       CREATE INDEX IF NOT EXISTS messages_channel ON messages(channel, seq);
       CREATE TABLE IF NOT EXISTS subs (endpoint TEXT PRIMARY KEY, principal TEXT, data TEXT, created INTEGER);
       CREATE TABLE IF NOT EXISTS images (id TEXT PRIMARY KEY, owner TEXT, type TEXT, size INTEGER, data BLOB, created INTEGER);
+      CREATE TABLE IF NOT EXISTS groups (id TEXT PRIMARY KEY, name TEXT, creator TEXT, created INTEGER);
+      CREATE TABLE IF NOT EXISTS group_members (group_id TEXT, member_id TEXT, added INTEGER, PRIMARY KEY (group_id, member_id));
+      CREATE INDEX IF NOT EXISTS group_members_member ON group_members(member_id);
+      CREATE TABLE IF NOT EXISTS reactions (seq INTEGER, who TEXT, emoji TEXT, channel TEXT, rseq INTEGER, PRIMARY KEY (seq, who));
+      CREATE INDEX IF NOT EXISTS reactions_rseq ON reactions(rseq);
     `);
     // Columns added after the first release.
     for (const sql of [
       "ALTER TABLE members ADD COLUMN phone TEXT DEFAULT ''",
       "ALTER TABLE members ADD COLUMN email TEXT DEFAULT ''",
       "ALTER TABLE buyers ADD COLUMN moved TEXT DEFAULT ''",
+      "ALTER TABLE members ADD COLUMN photo TEXT DEFAULT ''",
+      "ALTER TABLE members ADD COLUMN bio TEXT DEFAULT ''",
+      "ALTER TABLE members ADD COLUMN private INTEGER DEFAULT 0",
     ]) { try { this.sql.exec(sql); } catch {} }
     try {
       ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
@@ -171,8 +180,14 @@ export class ShowRoom extends DurableObject {
   buyer(id) {
     return this.sql.exec("SELECT * FROM buyers WHERE id = ?", id).toArray()[0] || null;
   }
-  publicMember(m) {
-    return { id: m.id, name: m.name, booth: m.booth || "", medium: m.medium || "", instagram: m.instagram || "", phone: m.phone || "", email: m.email || "", role: m.role, active: m.last_active || 0 };
+  // viewer: the member asking. A private profile shows other artists only the name and photo
+  // (the director still sees everything, to run the show). No viewer means the buyer's QR page.
+  publicMember(m, viewer) {
+    const priv = !!m.private;
+    if (priv && viewer && viewer.id !== m.id && viewer.role !== "director") {
+      return { id: m.id, name: m.name, photo: m.photo || "", role: m.role, private: true, booth: "", medium: "", instagram: "", phone: "", email: "", bio: "", active: 0 };
+    }
+    return { id: m.id, name: m.name, booth: m.booth || "", medium: m.medium || "", instagram: m.instagram || "", phone: m.phone || "", email: m.email || "", photo: m.photo || "", bio: m.bio || "", private: priv, role: m.role, active: m.last_active || 0 };
   }
   publicBuyer(b, withKey = false) {
     const out = { id: b.id, name: b.name || "", phone: b.phone || "", email: b.email || "", moved: b.moved || "", created: b.created, active: b.last_active || 0 };
@@ -287,6 +302,7 @@ export class ShowRoom extends DurableObject {
       if (path === "/push/subscribe" && method === "POST") return this.subscribe(p, await readJson(req));
       if (path === "/push/unsubscribe" && method === "POST") return this.unsubscribe(p, await readJson(req));
       if (path === "/upload" && method === "POST") return this.upload(p, req);
+      if (path === "/react" && method === "POST") return this.react(p, await readJson(req));
 
       if (p.type === "buyer") {
         if (path === "/buyer/sync") return this.buyerSync(p, Number(url.searchParams.get("since")) || 0, show);
@@ -296,10 +312,14 @@ export class ShowRoom extends DurableObject {
         return err("Not found", 404);
       }
 
-      if (path === "/sync") return this.sync(p.row, Number(url.searchParams.get("since")) || 0, show);
+      if (path === "/sync") return this.sync(p.row, Number(url.searchParams.get("since")) || 0, show, Number(url.searchParams.get("r")) || 0);
       if (path === "/send" && method === "POST") return this.send(p.row, await readJson(req), show);
       if (path === "/me" && method === "POST") return this.updateMe(p.row, await readJson(req));
       if (path === "/gallery" && method === "POST") return this.saveGallery(p.row, await readJson(req));
+      if (path === "/group/create" && method === "POST") return this.groupCreate(p.row, await readJson(req), show);
+      if (path === "/group/members" && method === "POST") return this.groupMembers(p.row, await readJson(req), show);
+      if (path === "/group/rename" && method === "POST") return this.groupRename(p.row, await readJson(req), show);
+      if (path === "/group/leave" && method === "POST") return this.groupLeave(p.row, await readJson(req), show);
 
       if (p.row.role !== "director") return err("Only the show director can do that.", 403);
       if (path === "/show" && method === "POST") return this.updateShow(show, await readJson(req));
@@ -315,7 +335,7 @@ export class ShowRoom extends DurableObject {
 
   showInfo(show) {
     const artists = this.sql.exec("SELECT COUNT(*) AS n FROM members WHERE removed = 0 AND role = 'artist'").one().n;
-    return { code: this.code, name: show.name, venue: show.venue || "", dates: show.dates || "", artists, mail: mailReady(this.env) };
+    return { code: this.code, name: show.name, venue: show.venue || "", dates: show.dates || "", artists, mail: mailReady(this.env), artistsPost: show.artistsPost !== false };
   }
 
   async init(body) {
@@ -388,7 +408,9 @@ export class ShowRoom extends DurableObject {
     if (body.name !== undefined) next.name = clean(body.name, LIMITS.name) || show.name;
     if (body.venue !== undefined) next.venue = clean(body.venue, LIMITS.venue);
     if (body.dates !== undefined) next.dates = clean(body.dates, LIMITS.dates);
+    if (body.artistsPost !== undefined) next.artistsPost = !!body.artistsPost;
     this.kvSet("show", next);
+    this.pokeSync(this.sql.exec("SELECT id FROM members WHERE removed = 0").toArray().map((r) => r.id));
     return json({ show: this.showInfo(next) });
   }
 
@@ -399,26 +421,39 @@ export class ShowRoom extends DurableObject {
     const instagram = body.instagram !== undefined ? cleanInstagram(body.instagram) : me.instagram;
     const phone = body.phone !== undefined ? clean(body.phone, LIMITS.phone) : me.phone;
     const email = body.email !== undefined ? clean(body.email, LIMITS.email) : me.email;
-    this.sql.exec("UPDATE members SET name = ?, booth = ?, medium = ?, instagram = ?, phone = ?, email = ? WHERE id = ?", name, booth, medium, instagram, phone, email, me.id);
+    const bio = body.bio !== undefined ? clean(body.bio, LIMITS.bio) : me.bio || "";
+    const priv = body.private !== undefined ? (body.private ? 1 : 0) : me.private || 0;
+    let photo = me.photo || "";
+    if (body.photo !== undefined) {
+      const id = String(body.photo || "");
+      if (!id) photo = "";
+      else if (/^[A-Za-z0-9]{16,40}$/.test(id) && this.sql.exec("SELECT COUNT(*) AS n FROM images WHERE id = ? AND owner = ?", id, me.id).one().n) photo = id;
+      else return err("That photo couldn't be used.");
+    }
+    this.sql.exec("UPDATE members SET name = ?, booth = ?, medium = ?, instagram = ?, phone = ?, email = ?, bio = ?, photo = ?, private = ? WHERE id = ?", name, booth, medium, instagram, phone, email, bio, photo, priv, me.id);
+    // Everyone's member list refreshes, so a new name, photo or privacy setting shows right away.
+    for (const ws of this.ctx.getWebSockets()) { const a = ws.deserializeAttachment() || {}; if (a.p && a.p.startsWith("m") && a.p !== me.id) try { ws.send(JSON.stringify({ t: "sync" })); } catch {} }
     return json({ me: this.publicMember(this.member(me.id)) });
   }
 
   visibleWhere() {
     return `(channel IN ('group', 'ann') OR (channel LIKE 'dm:%' AND instr(channel, ?1) > 0)
-             OR channel IN (SELECT 'buy:' || id FROM buyers WHERE artist_id = ?1))`;
+             OR channel IN (SELECT 'buy:' || id FROM buyers WHERE artist_id = ?1)
+             OR channel IN (SELECT 'g:' || group_id FROM group_members WHERE member_id = ?1))`;
   }
 
-  sync(me, since, show) {
+  sync(me, since, show, rsince = 0) {
     const rows = this.sql
       .exec(`SELECT * FROM messages WHERE seq > ?2 AND ${this.visibleWhere()} ORDER BY seq DESC LIMIT 600`, me.id, since)
       .toArray()
       .reverse();
     const lastSeq = this.maxSeq();
+    const rx = this.sql.exec(`SELECT seq, who, emoji, rseq FROM reactions WHERE rseq > ?2 AND ${this.visibleWhere()} ORDER BY rseq LIMIT 3000`, me.id, rsince).toArray();
     this.sql.exec("UPDATE members SET seen_seq = MAX(seen_seq, ?), last_active = ? WHERE id = ?", lastSeq, Date.now(), me.id);
     const members = this.sql
       .exec("SELECT * FROM members WHERE removed = 0 ORDER BY role = 'director' DESC, booth, name")
       .toArray()
-      .map((m) => this.publicMember(m));
+      .map((m) => this.publicMember(m, me));
     const buyers = this.sql
       .exec("SELECT * FROM buyers WHERE artist_id = ? ORDER BY created", me.id)
       .toArray()
@@ -432,6 +467,10 @@ export class ShowRoom extends DurableObject {
       me: this.publicMember(this.member(me.id)),
       show: this.showInfo(show),
       members,
+      groups: this.groupsFor(me.id),
+      reactions: rx.map((r) => ({ seq: r.seq, who: r.who, e: r.emoji })),
+      // If there were more than one page of reactions, the next sync picks up where this one stopped.
+      rseq: rx.length === 3000 ? rx[rx.length - 1].rseq : this.kvGet("rseq") || 0,
       buyers,
       messages: rows.map((r) => this.rowToMsg(r)),
       lastSeq,
@@ -461,18 +500,27 @@ export class ShowRoom extends DurableObject {
       kind = "ann";
       meta = { ...(meta || {}), urgent: !!(body.meta && body.meta.urgent) };
     } else if (channel === "group") {
+      if (show.artistsPost === false && me.role !== "director") return err("Only the show director posts in the Show chat.", 403);
       if (body.kind === "ref") {
         const to = this.member(body.meta && body.meta.to);
         if (!to) return err("Pick who the buyer should go see.");
         kind = "ref";
         meta = { to: to.id, status: clean(body.meta.status, 40) };
       } else if (!hasContent) return err("Empty message.");
+    } else if (channel.startsWith("g:")) {
+      if (!this.inGroup(channel.slice(2), me.id)) return err("You're not in that group.", 403);
+      if (!hasContent) return err("Empty message.");
     } else if (channel.startsWith("dm:")) {
       const ids = channel.slice(3).split(":");
       if (ids.length !== 2 || !ids.includes(me.id)) return err("You can't post there.", 403);
       const other = ids[0] === me.id ? ids[1] : ids[0];
       if (!this.member(other) || ids[0] > ids[1]) return err("You can't post there.", 403);
-      if (!hasContent) return err("Empty message.");
+      if (body.kind === "ref") {
+        // A buyer referral goes to the artist in your one-to-one chat with them.
+        if (!body.meta || body.meta.to !== other) return err("Pick who the buyer should go see.");
+        kind = "ref";
+        meta = { to: other, status: clean(body.meta.status, 40) };
+      } else if (!hasContent) return err("Empty message.");
     } else if (channel.startsWith("buy:")) {
       const b = this.buyer(channel.slice(4));
       if (!b || b.artist_id !== me.id) return err("You can't post there.", 403);
@@ -535,6 +583,7 @@ export class ShowRoom extends DurableObject {
       buyer: this.publicBuyer(b),
       artist: artist ? this.publicMember(artist) : null,
       gallery: artist ? this.gallery(artist.id) : null,
+      reactions: this.reactionsIn("buy:" + b.id),
       show: this.showInfo(show),
       messages: rows.map((r) => this.rowToMsg(r)),
       lastSeq: this.maxSeq(),
@@ -581,7 +630,25 @@ export class ShowRoom extends DurableObject {
     try {
       const m = JSON.parse(data);
       if (m.t === "vis") ws.serializeAttachment({ ...(ws.deserializeAttachment() || {}), vis: !!m.v });
+      else if (m.t === "typing") this.typing(ws, m);
     } catch {}
+  }
+  // "Someone is typing" dots: passed straight to the others in that chat, never stored.
+  typing(ws, m) {
+    const a = ws.deserializeAttachment() || {};
+    const ch = typeof m.ch === "string" ? m.ch.slice(0, 120) : "";
+    if (!a.p || !ch || ch === "ann") return;
+    const p = { type: a.p.startsWith("b") ? "buyer" : "member", id: a.p };
+    if (!this.canSee(p, ch)) return;
+    if (ch === "group" && p.type === "member") {
+      const show = this.kvGet("show") || {};
+      const me = this.member(p.id);
+      if (show.artistsPost === false && (!me || me.role !== "director")) return;
+    }
+    const people = new Set(this.participants(ch));
+    people.delete(a.p);
+    const payload = JSON.stringify({ t: "typing", ch, who: a.p, stop: !!m.stop });
+    for (const other of this.ctx.getWebSockets()) { const b = other.deserializeAttachment() || {}; if (people.has(b.p)) try { other.send(payload); } catch {} }
   }
   webSocketClose(ws, code) {
     try { ws.close(code === 1005 ? 1000 : code); } catch {}
@@ -590,6 +657,7 @@ export class ShowRoom extends DurableObject {
 
   recipients(msg) {
     const ch = msg.ch;
+    if (ch.startsWith("g:")) return this.groupMemberIds(ch.slice(2)).filter((id) => id !== msg.from);
     if (ch === "group" || ch === "ann") {
       return this.sql.exec("SELECT id FROM members WHERE removed = 0").toArray().map((r) => r.id).filter((id) => id !== msg.from);
     }
@@ -775,19 +843,28 @@ export class ShowRoom extends DurableObject {
     const senderName = sender ? sender.name || "A visitor" : "Show Chat";
     const base = `/s/${this.code}`;
     const snip = (s) => (s.length > 140 ? s.slice(0, 137) + "…" : s);
-    if (msg.kind === "system") return null;
+    if (msg.kind === "system") {
+      // Being started or added to a group gets an alert; other group notes and show notes don't.
+      if (!msg.ch.startsWith("g:") || !msg.meta || !msg.meta.push || to === msg.meta.by) return null;
+      const g = this.group(msg.ch.slice(2));
+      return { title: g ? g.name : "New group", body: snip(msg.body), url: base + "#" + msg.ch, tag: msg.ch };
+    }
     if (!msg.body && msg.meta && msg.meta.img) msg = { ...msg, body: "Sent a photo" };
     if (msg.kind === "move") return { title: `${senderName} moved to ${msg.meta.to === "text" ? "text" : msg.meta.to}`, body: snip(msg.body), url: base + "#" + msg.ch, tag: "buy-" + msg.ch.slice(4), urgent: true };
     if (msg.ch === "ann") {
-      return { title: (msg.meta && msg.meta.urgent ? "Urgent: " : "") + show.name, body: snip(msg.body), url: base + "#group", tag: "ann-" + msg.seq, urgent: !!(msg.meta && msg.meta.urgent) };
+      return { title: (msg.meta && msg.meta.urgent ? "Urgent: " : "Announcement: ") + show.name, body: snip(msg.body), url: base + "#group", tag: "ann-" + msg.seq, urgent: !!(msg.meta && msg.meta.urgent) };
     }
     if (msg.kind === "ref") {
       const target = this.member(msg.meta.to);
       if (to === msg.meta.to) {
         const from = sender && sender.booth ? `${senderName} (Booth ${sender.booth})` : senderName;
-        return { title: "Buyer heading your way", body: snip(`From ${from}: ${msg.body || "A buyer is coming to see you."}${msg.meta.status ? " · " + msg.meta.status : ""}`), url: base + "#group", tag: "ref-" + msg.seq, urgent: true };
+        return { title: "Buyer heading your way", body: snip(`From ${from}: ${msg.body || "A buyer is coming to see you."}${msg.meta.status ? " · " + msg.meta.status : ""}`), url: base + "#dm:" + msg.from, tag: "ref-" + msg.seq, urgent: true };
       }
-      return { title: show.name, body: snip(`${senderName} sent a buyer to ${target ? target.name : "another artist"}`), url: base + "#group", tag: "group" };
+      return { title: show.name, body: snip(`${senderName} sent a buyer to ${target ? target.name : "another artist"}`), url: base + "#chats", tag: "ref" };
+    }
+    if (msg.ch.startsWith("g:")) {
+      const g = this.group(msg.ch.slice(2));
+      return { title: `${senderName} · ${g ? g.name : "Group"}`, body: snip(msg.body), url: base + "#" + msg.ch, tag: msg.ch };
     }
     if (msg.ch === "group") return { title: `${senderName} · ${show.name}`, body: snip(msg.body), url: base + "#group", tag: "group" };
     if (msg.ch.startsWith("dm:")) return { title: senderName, body: snip(msg.body), url: base + "#dm:" + msg.from, tag: "dm-" + msg.from };
@@ -823,6 +900,122 @@ export class ShowRoom extends DurableObject {
       }
     }
     await Promise.allSettled(jobs);
+  }
+
+  // ---------- groups: only the people the creator adds ----------
+  group(id) {
+    return this.sql.exec("SELECT * FROM groups WHERE id = ?", String(id || "")).toArray()[0] || null;
+  }
+  groupMemberIds(id) {
+    return this.sql.exec("SELECT gm.member_id AS id FROM group_members gm JOIN members m ON m.id = gm.member_id WHERE gm.group_id = ? AND m.removed = 0 ORDER BY gm.added", id).toArray().map((r) => r.id);
+  }
+  inGroup(id, memberId) {
+    return this.sql.exec("SELECT COUNT(*) AS n FROM group_members WHERE group_id = ? AND member_id = ?", String(id || ""), memberId).one().n > 0;
+  }
+  groupsFor(memberId) {
+    return this.sql.exec("SELECT g.* FROM groups g JOIN group_members gm ON gm.group_id = g.id WHERE gm.member_id = ? ORDER BY g.created", memberId).toArray()
+      .map((g) => ({ id: g.id, name: g.name, creator: g.creator, created: g.created, members: this.groupMemberIds(g.id) }));
+  }
+  // Tell open apps to refresh their group lists (people added, removed, renamed).
+  pokeSync(ids) {
+    const set = new Set(ids);
+    for (const ws of this.ctx.getWebSockets()) { const a = ws.deserializeAttachment() || {}; if (set.has(a.p)) try { ws.send(JSON.stringify({ t: "sync" })); } catch {} }
+  }
+  groupNote(gid, body, show, by, push = false) {
+    // by: who did it, so their own phone doesn't count it as unread; push: tell the others with an alert.
+    const { msg } = this.insertMessage({ channel: "g:" + gid, sender: "system", kind: "system", body, meta: { by, push } });
+    this.notify(msg, show);
+  }
+  groupCreate(me, body, show) {
+    const gid = typeof body.id === "string" && /^g[a-z0-9]{6,20}$/.test(body.id) ? body.id : "g" + newToken().slice(0, 12).toLowerCase();
+    const existing = this.group(gid);
+    if (existing) {
+      if (!this.inGroup(gid, me.id)) return err("That group id is taken.", 409);
+      return json({ group: this.groupsFor(me.id).find((g) => g.id === gid) });
+    }
+    const picked = [...new Set((Array.isArray(body.members) ? body.members : []).map(String))].filter((id) => id !== me.id && this.member(id)).slice(0, 60);
+    if (!picked.length) return err("Add at least one person to the group.");
+    const count = this.sql.exec("SELECT COUNT(*) AS n FROM groups").one().n;
+    if (count >= 500) return err("This show has too many groups.", 403);
+    const names = picked.map((id) => this.member(id).name.split(/\s+/)[0]);
+    const name = clean(body.name, LIMITS.group) || [me.name.split(/\s+/)[0], ...names].slice(0, 4).join(", ");
+    const now = Date.now();
+    this.sql.exec("INSERT INTO groups (id, name, creator, created) VALUES (?, ?, ?, ?)", gid, name, me.id, now);
+    [me.id, ...picked].forEach((id, i) => this.sql.exec("INSERT OR IGNORE INTO group_members (group_id, member_id, added) VALUES (?, ?, ?)", gid, id, now + i));
+    this.groupNote(gid, `${me.name} started ${name} with ${names.join(", ")}.`, show, me.id, true);
+    return json({ group: this.groupsFor(me.id).find((g) => g.id === gid) });
+  }
+  groupMembers(me, body, show) {
+    const g = this.group(body.id);
+    if (!g || !this.inGroup(g.id, me.id)) return err("You're not in that group.", 403);
+    if (g.creator !== me.id) return err(`Only ${this.member(g.creator) ? this.member(g.creator).name : "the person who started the group"} can add or remove people.`, 403);
+    const before = this.groupMemberIds(g.id);
+    const add = (Array.isArray(body.add) ? body.add : []).map(String).filter((id) => this.member(id) && !before.includes(id));
+    const remove = (Array.isArray(body.remove) ? body.remove : []).map(String).filter((id) => id !== me.id && before.includes(id));
+    if (before.length + add.length - remove.length > 61) return err("A group can have up to 61 people.");
+    const now = Date.now();
+    add.forEach((id, i) => this.sql.exec("INSERT OR IGNORE INTO group_members (group_id, member_id, added) VALUES (?, ?, ?)", g.id, id, now + i));
+    for (const id of remove) this.sql.exec("DELETE FROM group_members WHERE group_id = ? AND member_id = ?", g.id, id);
+    const nm = (ids) => ids.map((id) => this.member(id).name).join(", ");
+    if (add.length) this.groupNote(g.id, `${me.name} added ${nm(add)}.`, show, me.id, true);
+    if (remove.length) { this.groupNote(g.id, `${me.name} removed ${nm(remove)}.`, show, me.id); this.pokeSync(remove); }
+    return json({ group: this.groupsFor(me.id).find((x) => x.id === g.id) });
+  }
+  groupRename(me, body, show) {
+    const g = this.group(body.id);
+    if (!g || !this.inGroup(g.id, me.id)) return err("You're not in that group.", 403);
+    if (g.creator !== me.id) return err("Only the person who started the group can rename it.", 403);
+    const name = clean(body.name, LIMITS.group);
+    if (!name) return err("Give the group a name.");
+    if (name !== g.name) { this.sql.exec("UPDATE groups SET name = ? WHERE id = ?", name, g.id); this.groupNote(g.id, `${me.name} renamed the group ${name}.`, show, me.id); }
+    return json({ group: this.groupsFor(me.id).find((x) => x.id === g.id) });
+  }
+  groupLeave(me, body, show) {
+    const g = this.group(body.id);
+    if (!g || !this.inGroup(g.id, me.id)) return json({ ok: true });
+    this.sql.exec("DELETE FROM group_members WHERE group_id = ? AND member_id = ?", g.id, me.id);
+    const left = this.groupMemberIds(g.id);
+    // If the person who started it leaves, the longest-standing member looks after it.
+    if (g.creator === me.id && left.length) this.sql.exec("UPDATE groups SET creator = ? WHERE id = ?", left[0], g.id);
+    this.groupNote(g.id, `${me.name} left the group.`, show, me.id);
+    this.pokeSync([me.id]);
+    return json({ ok: true });
+  }
+
+  // ---------- reactions: one per person per message, everyone in the chat sees them live ----------
+  canSee(p, channel) {
+    if (p.type === "buyer") return channel === "buy:" + p.id;
+    if (channel === "ann" || channel === "group") return true;
+    if (channel.startsWith("g:")) return this.inGroup(channel.slice(2), p.id);
+    if (channel.startsWith("dm:")) return channel.slice(3).split(":").includes(p.id);
+    if (channel.startsWith("buy:")) { const b = this.buyer(channel.slice(4)); return !!b && b.artist_id === p.id; }
+    return false;
+  }
+  participants(channel) {
+    if (channel === "ann" || channel === "group") return this.sql.exec("SELECT id FROM members WHERE removed = 0").toArray().map((r) => r.id);
+    if (channel.startsWith("g:")) return this.groupMemberIds(channel.slice(2));
+    if (channel.startsWith("dm:")) return channel.slice(3).split(":");
+    if (channel.startsWith("buy:")) { const b = this.buyer(channel.slice(4)); return b ? [b.id, b.artist_id] : []; }
+    return [];
+  }
+  react(p, body) {
+    const seq = Number(body.seq);
+    const e = body.e ? String(body.e) : "";
+    if (e && !REACTIONS.includes(e)) return err("Pick a reaction.");
+    const row = Number.isInteger(seq) ? this.sql.exec("SELECT seq, channel, kind FROM messages WHERE seq = ?", seq).toArray()[0] : null;
+    if (!row || !this.canSee(p, row.channel)) return err("You can't react to that.", 403);
+    if (row.kind === "system" || row.kind === "move") return err("You can't react to that.");
+    if (this.floodCheck("r:" + p.id)) return err("Slow down a little. Try again in a moment.", 429);
+    const rseq = (this.kvGet("rseq") || 0) + 1;
+    this.kvSet("rseq", rseq);
+    this.sql.exec("INSERT INTO reactions (seq, who, emoji, channel, rseq) VALUES (?, ?, ?, ?, ?) ON CONFLICT(seq, who) DO UPDATE SET emoji = excluded.emoji, rseq = excluded.rseq", seq, p.id, e, row.channel, rseq);
+    const payload = JSON.stringify({ t: "react", seq, ch: row.channel, who: p.id, e, rseq });
+    const people = new Set(this.participants(row.channel));
+    for (const ws of this.ctx.getWebSockets()) { const a = ws.deserializeAttachment() || {}; if (people.has(a.p)) try { ws.send(payload); } catch {} }
+    return json({ ok: true, seq, who: p.id, e, rseq });
+  }
+  reactionsIn(channel) {
+    return this.sql.exec("SELECT seq, who, emoji FROM reactions WHERE channel = ? AND emoji != ''", channel).toArray().map((r) => ({ seq: r.seq, who: r.who, e: r.emoji }));
   }
 
   // ---------- photos ----------

@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "test": "node test/webpush.test.mjs && node test/e2e.test.mjs",
+    "test": "node test/webpush.test.mjs && node test/e2e.test.mjs && node test/groups.test.mjs && node test/ui.test.mjs && node test/gallery.test.mjs && node test/features.test.mjs",
     "test:mail": "node test/mail.test.mjs",
     "test:load": "node test/load.test.mjs"
   },

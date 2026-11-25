@@ -49,7 +49,8 @@ assert(maya && maya.token, "artist signed in");
 
 // Artist opens the chat and posts
 a = browser(`/s/${code}#group`, { "asc.sessions": artStore }); await sleep(900);
-assert(text(a).includes("Show chat") && text(a).includes("Buyers"), "artist sees Show chat, Direct, Buyers tabs");
+const tabNames = [...a.document.querySelectorAll("[data-tab]")].map((t) => t.textContent.trim());
+assert(JSON.stringify(tabNames) === JSON.stringify(["Show", "DMs", "Groups", "Buyers"]), "artist sees Show, DMs, Groups and Buyers tabs");
 a.document.getElementById("compose-input").value = "Hello from booth A14";
 submit(a, "form.composer"); await sleep(700);
 assert(text(a).includes("Hello from booth A14") && !text(a).includes("Sending"), "message sent and shown");
