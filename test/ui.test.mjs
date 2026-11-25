@@ -102,6 +102,6 @@ assert(text(b).includes("Yes, come by A14!"), "buyer sees the reply live");
 
 // Cards
 let c = browser(`/s/${code}/cards`, { "asc.sessions": dirStore }); await sleep(800);
-assert(c.document.querySelectorAll(".qrcard svg").length === 2 && text(c).includes("Booth A14"), "director prints artist card plus join card");
+assert(c.document.querySelectorAll(".qrcard svg").length === 3 && text(c).includes("Booth A14") && text(c).includes("Save your favorites"), "director prints artist card plus join and visitor cards");
 console.log("\nAll UI checks passed.");
 process.exit(0);
